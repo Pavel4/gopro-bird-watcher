@@ -1,0 +1,74 @@
+services:
+  nginx-rtmp:
+    image: tiangolo/nginx-rtmp
+    container_name: gopro-rtmp-server
+    ports:
+      - "1935:1935"   # RTMP порт для приёма потока от GoPro
+      - "8080:80"     # HTTP порт для статистики
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./recordings:/recordings
+    restart: unless-stopped
+
+  motion-detector:
+    build: ./detector
+    container_name: gopro-motion-detector
+    volumes:
+      - ./recordings:/recordings
+      - ./logs:/logs
+      - ./control:/tmp/control
+    environment:
+      - RTMP_URL=rtmp://nginx-rtmp/live
+      - OUTPUT_DIR=/recordings
+      - LOG_FILE=/logs/motion_detector.log
+      - TZ=Europe/Moscow
+      # Буфер записи
+      - BUFFER_SECONDS=3
+      - POST_MOTION_SECONDS=3
+      # Пороги для значимого движения
+      - MIN_CONTOUR_AREA=500        # Мин. площадь одного контура (пиксели)
+      - MIN_MOTION_FRAMES=3         # Мин. кадров подряд для срабатывания
+      - MOTION_AREA_PERCENT=2.5     # Мин. % площади кадра с движением
+      # Управление
+      - AUTO_START_RECORDING=false
+      - CONTROL_FILE=/tmp/control/command
+    depends_on:
+      - nginx-rtmp
+    restart: unless-stopped
+
+  # Dev-контейнер для разработки и анализа
+  # Запуск: docker-compose --profile dev run --rm dev bash
+  dev:
+    build: ./detector
+    container_name: gopro-dev
+    volumes:
+      - .:/app
+    environment:
+      - RTMP_URL=rtmp://nginx-rtmp/live
+      - OUTPUT_DIR=/app/recordings
+      - LOG_FILE=/app/logs/motion_detector.log
+      - TZ=Europe/Moscow
+      - BUFFER_SECONDS=5
+      - POST_MOTION_SECONDS=5
+      - MIN_CONTOUR_AREA=500
+      - MIN_MOTION_FRAMES=3
+      - MOTION_AREA_PERCENT=0.5
+      - CONTROL_FILE=/app/control/command
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    profiles:
+      - dev
+    depends_on:
+      - nginx-rtmp
+    command: bash
+
+  # Опционально: веб-плеер для просмотра в браузере
+  # web-player:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "8081:80"
+  #   volumes:
+  #     - ./web:/usr/share/nginx/html:ro
+  #   depends_on:
+  #     - nginx-rtmp

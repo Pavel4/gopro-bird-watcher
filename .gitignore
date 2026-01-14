@@ -1,0 +1,29 @@
+# OS
+.DS_Store
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Recordings (keep folder structure)
+recordings/motion/*.mp4
+recordings/manual/*.mp4
+
+# Logs
+logs/*.log
+
+# Control files (runtime)
+control/command
+
+# Local config (optional, may want to keep example)
+# config.env
