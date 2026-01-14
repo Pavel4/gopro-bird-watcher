@@ -18,6 +18,7 @@ venv/
 # Recordings (keep folder structure)
 recordings/motion/*.mp4
 recordings/manual/*.mp4
+recordings/.segments/
 
 # Logs
 logs/*.log
