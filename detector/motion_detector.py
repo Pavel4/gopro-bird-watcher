@@ -18,7 +18,6 @@ import subprocess
 import shutil
 import glob
 from datetime import datetime, timezone, timedelta
-from collections import deque
 from threading import Thread, Event, Lock
 from enum import Enum
 import logging
@@ -26,12 +25,27 @@ import logging
 # Московское время (UTC+3)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
+# === Константы по умолчанию ===
+DEFAULT_RTMP_URL = "rtmp://nginx-rtmp/live"
+DEFAULT_OUTPUT_DIR = "/recordings"
+DEFAULT_LOG_FILE = "/logs/motion_detector.log"
+DEFAULT_CONTROL_FILE = "/tmp/control/command"
+DEFAULT_BUFFER_SECONDS = 5
+DEFAULT_POST_MOTION_SECONDS = 5
+DEFAULT_MIN_CONTOUR_AREA = 500
+DEFAULT_MIN_MOTION_FRAMES = 3
+DEFAULT_MOTION_AREA_PERCENT = 0.5
+DEFAULT_EXTEND_MOTION_PERCENT = 0.2
+DEFAULT_SEGMENT_DURATION = 1
+DEFAULT_AUTO_START_MOTION = False
+DEFAULT_DEBUG_MOTION = False
+
 
 class RecordingType(Enum):
     """Тип записи."""
     NONE = "none"
-    MOTION = "motion"  # Автоматическая запись при движении
-    MANUAL = "manual"  # Принудительная запись по команде
+    MOTION = "motion"
+    MANUAL = "manual"
 
 
 def setup_logging(log_file: str = None):
@@ -42,8 +56,9 @@ def setup_logging(log_file: str = None):
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
     
+    # DEBUG уровень для отладки движения
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=handlers
     )
@@ -53,24 +68,17 @@ def setup_logging(log_file: str = None):
 class SegmentRecorder:
     """
     Записывает RTMP поток короткими сегментами через FFmpeg.
-    Позволяет потом объединять сегменты в итоговое видео.
+    Сегменты именуются с timestamp для точного выбора по времени.
     """
     
     def __init__(
         self,
         rtmp_url: str,
         segments_dir: str,
-        segment_duration: int = 2,
-        max_segments: int = 60,
+        segment_duration: int = 1,
+        max_segments: int = 180,
         logger: logging.Logger = None
     ):
-        """
-        Args:
-            rtmp_url: URL RTMP потока
-            segments_dir: Папка для временных сегментов
-            segment_duration: Длительность одного сегмента в секундах
-            max_segments: Максимальное количество хранимых сегментов
-        """
         self.rtmp_url = rtmp_url
         self.segments_dir = segments_dir
         self.segment_duration = segment_duration
@@ -82,12 +90,183 @@ class SegmentRecorder:
         self.stop_event = Event()
         self.lock = Lock()
         
+        # Флаг для приостановки cleanup во время записи
+        self.cleanup_paused = False
+        
         # Очищаем и создаём папку сегментов
-        if os.path.exists(segments_dir):
-            shutil.rmtree(segments_dir)
-        os.makedirs(segments_dir, exist_ok=True)
+        self._clean_segments_dir()
         
         self.logger.info(f"SegmentRecorder initialized: {segments_dir}")
+    
+    def _kill_existing_ffmpeg(self):
+        """Убить все существующие FFmpeg процессы записи сегментов."""
+        killed = False
+        
+        # Способ 1: pkill (работает в большинстве контейнеров)
+        try:
+            result = subprocess.run(
+                ["pkill", "-9", "-f", f"ffmpeg.*{self.segments_dir}"],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                killed = True
+                self.logger.info("Killed existing FFmpeg processes via pkill")
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        
+        # Способ 2: killall ffmpeg (если pkill не сработал)
+        if not killed:
+            try:
+                subprocess.run(["killall", "-9", "ffmpeg"], 
+                              capture_output=True, timeout=5)
+            except Exception:
+                pass
+    
+    def _clean_segments_dir(self):
+        """Безопасно очищаем папку сегментов."""
+        # Сначала убиваем старые FFmpeg процессы
+        self._kill_existing_ffmpeg()
+        time.sleep(0.5)
+        
+        try:
+            if os.path.exists(self.segments_dir):
+                # Удаляем только .ts и .txt файлы
+                for pattern in ["*.ts", "*.txt"]:
+                    for f in glob.glob(os.path.join(self.segments_dir, pattern)):
+                        try:
+                            os.remove(f)
+                        except Exception:
+                            pass
+            os.makedirs(self.segments_dir, exist_ok=True)
+        except Exception as e:
+            self.logger.warning(f"Error cleaning segments dir: {e}")
+            os.makedirs(self.segments_dir, exist_ok=True)
+    
+    def _start_ffmpeg(self):
+        """Внутренний метод запуска FFmpeg процесса."""
+        segment_pattern = os.path.join(self.segments_dir, "seg_%Y%m%d_%H%M%S.ts")
+        
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel", "warning",
+            "-i", self.rtmp_url,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-f", "segment",
+            "-segment_time", str(self.segment_duration),
+            "-segment_format", "mpegts",
+            "-segment_atclocktime", "1",
+            "-reset_timestamps", "1",
+            "-strftime", "1",
+            segment_pattern
+        ]
+        
+        self.ffmpeg_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE
+        )
+        
+        # Поток для логирования stderr
+        def log_stderr():
+            try:
+                for line in self.ffmpeg_process.stderr:
+                    line = line.decode().strip()
+                    if line:
+                        self.logger.debug(f"FFmpeg: {line}")
+            except Exception:
+                pass
+        
+        Thread(target=log_stderr, daemon=True).start()
+        
+        self.last_segment_time = time.time()
+        return self.ffmpeg_process
+    
+    def _monitor_ffmpeg(self):
+        """Мониторинг и автоперезапуск FFmpeg."""
+        restart_count = 0
+        max_restarts = 20
+        
+        # Даём FFmpeg время на старт
+        time.sleep(5)
+        
+        while not self.stop_event.is_set() and restart_count < max_restarts:
+            time.sleep(5)
+            
+            if self.stop_event.is_set():
+                break
+            
+            # Проверяем живой ли процесс
+            if self.ffmpeg_process is None or self.ffmpeg_process.poll() is not None:
+                exit_code = self.ffmpeg_process.poll() if self.ffmpeg_process else "N/A"
+                restart_count += 1
+                self.logger.warning(
+                    f"⚠️ FFmpeg died (exit={exit_code})! "
+                    f"Restarting ({restart_count}/{max_restarts})..."
+                )
+                time.sleep(2)
+                try:
+                    self._start_ffmpeg()
+                    self.logger.info("✅ FFmpeg restarted successfully")
+                    time.sleep(3)  # Даём время на старт
+                except Exception as e:
+                    self.logger.error(f"Failed to restart FFmpeg: {e}")
+                    time.sleep(5)
+                continue
+            
+            # Проверяем создаются ли новые сегменты (только если уже есть сегменты)
+            try:
+                segments = glob.glob(os.path.join(self.segments_dir, "seg_*.ts"))
+                if len(segments) < 3:
+                    continue
+                
+                # Безопасно получаем время самого нового сегмента
+                newest_time = 0
+                for seg in segments:
+                    try:
+                        mtime = os.path.getmtime(seg)
+                        if mtime > newest_time:
+                            newest_time = mtime
+                    except FileNotFoundError:
+                        continue  # Файл удалён, пропускаем
+                
+                if newest_time == 0:
+                    continue
+                
+                stale_seconds = time.time() - newest_time
+                
+                # Если сегменты не создавались более 15 секунд — проблема
+                if stale_seconds > 15:
+                    restart_count += 1
+                    self.logger.warning(
+                        f"⚠️ No new segments for {stale_seconds:.0f}s! "
+                        f"Restarting FFmpeg ({restart_count}/{max_restarts})..."
+                    )
+                    try:
+                        if self.ffmpeg_process:
+                            self.ffmpeg_process.kill()
+                            self.ffmpeg_process.wait(timeout=3)
+                    except Exception:
+                        pass
+                    
+                    time.sleep(2)
+                    try:
+                        self._start_ffmpeg()
+                        self.logger.info("✅ FFmpeg restarted (stale segments)")
+                        time.sleep(3)
+                    except Exception as e:
+                        self.logger.error(f"Failed to restart FFmpeg: {e}")
+                        time.sleep(5)
+            except Exception:
+                pass  # Игнорируем ошибки в мониторинге
+        
+        if restart_count >= max_restarts:
+            self.logger.error(f"❌ FFmpeg failed {max_restarts} times. Giving up.")
     
     def start(self):
         """Запустить запись сегментов."""
@@ -97,40 +276,20 @@ class SegmentRecorder:
         self.stop_event.clear()
         self.is_running = True
         
-        # Запускаем FFmpeg для записи сегментов
-        # Формат: segment_%05d.ts (segment_00001.ts, segment_00002.ts, ...)
-        segment_pattern = os.path.join(self.segments_dir, "seg_%05d.ts")
-        
-        cmd = [
-            "ffmpeg",
-            "-y",  # Перезаписывать файлы
-            "-i", self.rtmp_url,
-            "-c:v", "copy",  # Копируем видео без перекодирования
-            "-c:a", "aac",   # Аудио в AAC
-            "-f", "segment",
-            "-segment_time", str(self.segment_duration),
-            "-segment_format", "mpegts",
-            "-reset_timestamps", "1",
-            "-strftime", "0",
-            segment_pattern
-        ]
-        
-        self.logger.info(f"Starting FFmpeg segment recorder...")
-        self.logger.debug(f"Command: {' '.join(cmd)}")
+        self.logger.info("Starting FFmpeg segment recorder...")
         
         try:
-            self.ffmpeg_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE
-            )
+            self._start_ffmpeg()
             
-            # Запускаем поток для очистки старых сегментов
+            # Поток мониторинга FFmpeg (перезапуск при падении)
+            self.monitor_thread = Thread(target=self._monitor_ffmpeg, daemon=True)
+            self.monitor_thread.start()
+            
+            # Поток очистки старых сегментов
             self.cleanup_thread = Thread(target=self._cleanup_old_segments, daemon=True)
             self.cleanup_thread.start()
             
-            self.logger.info("SegmentRecorder started")
+            self.logger.info("SegmentRecorder started (with auto-restart)")
         except Exception as e:
             self.logger.error(f"Failed to start FFmpeg: {e}")
             self.is_running = False
@@ -143,81 +302,117 @@ class SegmentRecorder:
         self.stop_event.set()
         self.is_running = False
         
+        # Пробуем мягко остановить
         if self.ffmpeg_process:
             try:
                 self.ffmpeg_process.stdin.write(b'q')
                 self.ffmpeg_process.stdin.flush()
-                self.ffmpeg_process.wait(timeout=5)
+                self.ffmpeg_process.wait(timeout=3)
             except Exception:
-                self.ffmpeg_process.kill()
+                pass
+            
+            # Если ещё жив - убиваем
+            if self.ffmpeg_process.poll() is None:
+                try:
+                    self.ffmpeg_process.kill()
+                    self.ffmpeg_process.wait(timeout=2)
+                except Exception:
+                    pass
             self.ffmpeg_process = None
+        
+        # Убиваем ВСЕ процессы FFmpeg которые пишут в нашу папку
+        self._kill_existing_ffmpeg()
         
         self.logger.info("SegmentRecorder stopped")
     
+    def pause_cleanup(self):
+        """Приостановить очистку сегментов."""
+        self.cleanup_paused = True
+    
+    def resume_cleanup(self):
+        """Возобновить очистку сегментов."""
+        self.cleanup_paused = False
+    
     def _cleanup_old_segments(self):
-        """Удаляет старые сегменты, оставляя только последние max_segments."""
+        """Удаляет старые сегменты, оставляя последние max_segments."""
         while not self.stop_event.is_set():
-            try:
-                with self.lock:
-                    segments = self._get_sorted_segments()
-                    if len(segments) > self.max_segments:
-                        # Удаляем самые старые
-                        to_delete = segments[:-self.max_segments]
-                        for seg in to_delete:
-                            try:
-                                os.remove(seg)
-                            except Exception:
-                                pass
-            except Exception as e:
-                self.logger.error(f"Cleanup error: {e}")
+            if not self.cleanup_paused:
+                try:
+                    with self.lock:
+                        segments = self._get_sorted_segments()
+                        if len(segments) > self.max_segments:
+                            to_delete = segments[:-self.max_segments]
+                            for seg in to_delete:
+                                try:
+                                    os.remove(seg)
+                                except FileNotFoundError:
+                                    pass  # Уже удалён, это нормально
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
             
-            time.sleep(self.segment_duration)
+            time.sleep(self.segment_duration * 5)
     
     def _get_sorted_segments(self) -> list:
-        """Получить список сегментов, отсортированных по времени создания."""
+        """Получить список сегментов, отсортированных по имени (timestamp)."""
         pattern = os.path.join(self.segments_dir, "seg_*.ts")
         segments = glob.glob(pattern)
-        return sorted(segments, key=lambda x: os.path.getmtime(x))
+        return sorted(segments)
     
-    def get_recent_segments(self, seconds: int) -> list:
-        """
-        Получить сегменты за последние N секунд.
-        
-        Args:
-            seconds: Количество секунд
-            
-        Returns:
-            Список путей к сегментам
-        """
-        with self.lock:
-            segments = self._get_sorted_segments()
-            
-            # Сколько сегментов нам нужно
-            num_segments = max(1, seconds // self.segment_duration + 1)
-            
-            # Берём последние N сегментов
-            return segments[-num_segments:] if segments else []
+    def _get_segment_time(self, segment_path: str) -> float:
+        """Получить время создания сегмента (mtime файла)."""
+        try:
+            return os.path.getmtime(segment_path)
+        except Exception:
+            return 0
     
-    def get_all_segments_since(self, start_time: float) -> list:
+    def get_segments_in_time_range(
+        self, 
+        start_time: float, 
+        end_time: float = None
+    ) -> list:
         """
-        Получить все сегменты с указанного времени.
+        Получить сегменты в указанном временном диапазоне.
         
         Args:
             start_time: Unix timestamp начала
-            
-        Returns:
-            Список путей к сегментам
+            end_time: Unix timestamp конца, None = текущее время
         """
+        if end_time is None:
+            end_time = time.time()
+        
         with self.lock:
             segments = self._get_sorted_segments()
             result = []
+            
+            # Расширяем диапазон на 2 сегмента с каждой стороны
+            margin = self.segment_duration * 2
+            
             for seg in segments:
                 try:
-                    if os.path.getmtime(seg) >= start_time:
+                    if not os.path.exists(seg):
+                        continue
+                    
+                    seg_time = os.path.getmtime(seg)
+                    seg_size = os.path.getsize(seg)
+                    
+                    # Проверяем что сегмент в нужном диапазоне и не пустой
+                    if (seg_time >= start_time - margin and 
+                        seg_time <= end_time + margin and
+                        seg_size > 1000):  # Минимум 1KB
                         result.append(seg)
                 except Exception:
-                    pass
+                    continue
+            
+            # Сортируем по времени создания
+            result.sort(key=lambda x: os.path.getmtime(x))
+            
             return result
+    
+    def get_current_time(self) -> float:
+        """Получить текущее время."""
+        return time.time()
 
 
 class VideoMerger:
@@ -226,54 +421,49 @@ class VideoMerger:
     def __init__(self, logger: logging.Logger = None):
         self.logger = logger or logging.getLogger(__name__)
     
-    def merge_segments(
-        self,
-        segments: list,
-        output_path: str,
-        copy_codec: bool = True
-    ) -> bool:
-        """
-        Объединить сегменты в один файл.
-        
-        Args:
-            segments: Список путей к сегментам
-            output_path: Путь к выходному файлу
-            copy_codec: Копировать кодеки без перекодирования
-            
-        Returns:
-            True если успешно
-        """
+    def merge_segments(self, segments: list, output_path: str) -> bool:
+        """Объединить сегменты в один файл."""
         if not segments:
             self.logger.error("No segments to merge")
             return False
         
+        # Фильтруем только существующие и непустые файлы
+        valid_segments = []
+        for s in segments:
+            if os.path.exists(s):
+                size = os.path.getsize(s)
+                if size > 1000:  # Минимум 1KB
+                    valid_segments.append(s)
+        
+        if not valid_segments:
+            self.logger.error("No valid segments to merge")
+            return False
+        
+        if len(valid_segments) != len(segments):
+            self.logger.warning(
+                f"Filtered segments: {len(valid_segments)}/{len(segments)} valid"
+            )
+        
         # Создаём временный файл со списком сегментов
-        list_file = output_path + ".txt"
+        list_file = output_path + ".concat.txt"
         
         try:
             with open(list_file, 'w') as f:
-                for seg in segments:
-                    # Экранируем путь для ffmpeg concat
-                    escaped_path = seg.replace("'", "'\\''")
+                for seg in valid_segments:
+                    # Абсолютный путь для надёжности
+                    abs_path = os.path.abspath(seg)
+                    escaped_path = abs_path.replace("'", "'\\''")
                     f.write(f"file '{escaped_path}'\n")
             
-            # Формируем команду ffmpeg
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file,
+                "-c", "copy",
+                output_path
             ]
-            
-            if copy_codec:
-                cmd.extend(["-c", "copy"])
-            else:
-                cmd.extend(["-c:v", "libx264", "-c:a", "aac"])
-            
-            cmd.append(output_path)
-            
-            self.logger.debug(f"Merge command: {' '.join(cmd)}")
             
             result = subprocess.run(
                 cmd,
@@ -281,19 +471,45 @@ class VideoMerger:
                 timeout=120
             )
             
-            if result.returncode != 0:
-                self.logger.error(f"FFmpeg merge failed: {result.stderr.decode()}")
-                return False
+            success = result.returncode == 0 and os.path.exists(output_path)
             
-            return True
+            if not success:
+                stderr_output = result.stderr.decode()
+                # Ищем реальную ошибку (пропускаем header)
+                error_lines = [l for l in stderr_output.split('\n') 
+                              if 'error' in l.lower() or 'invalid' in l.lower()]
+                if error_lines:
+                    self.logger.error(f"FFmpeg error: {error_lines[-1][:200]}")
+                else:
+                    # Показываем последние строки
+                    self.logger.error(f"FFmpeg failed: {stderr_output[-500:]}")
+            
+            return success
             
         except Exception as e:
             self.logger.error(f"Merge error: {e}")
             return False
         finally:
-            # Удаляем временный файл списка
-            if os.path.exists(list_file):
-                os.remove(list_file)
+            # Всегда удаляем временный файл списка
+            try:
+                if os.path.exists(list_file):
+                    os.remove(list_file)
+            except Exception:
+                pass
+
+
+def get_video_duration(filepath: str) -> float:
+    """Получить длительность видео через ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
+            capture_output=True,
+            timeout=10
+        )
+        return float(result.stdout.decode().strip())
+    except Exception:
+        return 0.0
 
 
 class MotionDetector:
@@ -301,28 +517,18 @@ class MotionDetector:
     
     def __init__(
         self,
-        rtmp_url: str = "rtmp://nginx-rtmp/live",
-        output_dir: str = "/recordings",
-        log_file: str = "/logs/motion_detector.log",
-        buffer_seconds: int = 5,
-        post_motion_seconds: int = 5,
-        min_contour_area: int = 500,
-        min_motion_frames: int = 3,
-        motion_area_percent: float = 0.5,
-        segment_duration: int = 2
+        rtmp_url: str = DEFAULT_RTMP_URL,
+        output_dir: str = DEFAULT_OUTPUT_DIR,
+        log_file: str = DEFAULT_LOG_FILE,
+        buffer_seconds: int = DEFAULT_BUFFER_SECONDS,
+        post_motion_seconds: int = DEFAULT_POST_MOTION_SECONDS,
+        min_contour_area: int = DEFAULT_MIN_CONTOUR_AREA,
+        min_motion_frames: int = DEFAULT_MIN_MOTION_FRAMES,
+        motion_area_percent: float = DEFAULT_MOTION_AREA_PERCENT,
+        extend_motion_percent: float = DEFAULT_EXTEND_MOTION_PERCENT,
+        debug_motion: bool = DEFAULT_DEBUG_MOTION,
+        segment_duration: int = DEFAULT_SEGMENT_DURATION
     ):
-        """
-        Args:
-            rtmp_url: URL RTMP потока
-            output_dir: Базовая директория для сохранения видео
-            log_file: Путь к файлу логов
-            buffer_seconds: Секунд до движения для записи
-            post_motion_seconds: Секунд после ОКОНЧАНИЯ движения для записи
-            min_contour_area: Минимальная площадь одного контура движения (пиксели)
-            min_motion_frames: Мин. кадров подряд с движением для начала записи
-            motion_area_percent: Мин. % площади кадра с движением для срабатывания
-            segment_duration: Длительность одного сегмента записи (сек)
-        """
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
         self.buffer_seconds = buffer_seconds
@@ -330,6 +536,8 @@ class MotionDetector:
         self.min_contour_area = min_contour_area
         self.min_motion_frames = min_motion_frames
         self.motion_area_percent = motion_area_percent
+        self.extend_motion_percent = extend_motion_percent
+        self.debug_motion = debug_motion
         self.segment_duration = segment_duration
         
         # Логирование
@@ -347,7 +555,7 @@ class MotionDetector:
             rtmp_url=rtmp_url,
             segments_dir=self.segments_dir,
             segment_duration=segment_duration,
-            max_segments=120,  # ~4 минуты буфера
+            max_segments=300,  # ~5 минут буфера
             logger=self.logger
         )
         self.video_merger = VideoMerger(logger=self.logger)
@@ -364,13 +572,15 @@ class MotionDetector:
             history=500, varThreshold=16, detectShadows=False
         )
         
-        # Состояние записи
+        # Состояние записи (с блокировкой для thread-safety)
+        self.recording_lock = Lock()
         self.is_recording = False
         self.recording_type = RecordingType.NONE
         self.motion_detection_enabled = False
-        self.recording_start_time = None
-        self.recording_segments_start = None  # Время начала сбора сегментов
-        self.buffer_segments = []  # Сегменты буфера (до движения)
+        
+        # Временные метки для выбора сегментов
+        self.recording_buffer_start_time = None  # Начало буфера (ДО движения)
+        self.recording_start_time = None          # Начало записи (момент движения)
         
         # Состояние движения
         self.last_motion_time = 0
@@ -392,6 +602,12 @@ class MotionDetector:
         self.logger.info(f"  Output dirs: motion={self.motion_dir}, manual={self.manual_dir}")
         self.logger.info(f"  Buffer: {buffer_seconds}s before, {post_motion_seconds}s after")
         self.logger.info(f"  Segment duration: {segment_duration}s")
+        self.logger.info(
+            f"  Motion thresholds: start={motion_area_percent}%, "
+            f"extend={extend_motion_percent}%"
+        )
+        if debug_motion:
+            self.logger.info(f"  DEBUG MODE: motion % will be logged")
     
     def get_moscow_time(self) -> datetime:
         """Получить текущее время по Москве."""
@@ -426,12 +642,7 @@ class MotionDetector:
         return True
     
     def detect_motion(self, frame: np.ndarray) -> tuple:
-        """
-        Детекция движения в кадре.
-        
-        Returns:
-            (motion_detected, motion_area_percent)
-        """
+        """Детекция движения в кадре."""
         fg_mask = self.background_subtractor.apply(frame)
         
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -453,66 +664,106 @@ class MotionDetector:
         
         return motion_detected, motion_percent
     
+    def _check_segments_fresh(self, max_age: float = 5.0) -> bool:
+        """Проверить что сегменты свежие (FFmpeg работает)."""
+        segments = glob.glob(
+            os.path.join(self.segment_recorder.segments_dir, "seg_*.ts")
+        )
+        if not segments:
+            return False
+        
+        newest = max(segments, key=os.path.getmtime)
+        age = time.time() - os.path.getmtime(newest)
+        return age < max_age
+    
     def start_recording(self, rec_type: RecordingType):
-        """
-        Начать запись видео.
-        
-        Args:
-            rec_type: Тип записи (MOTION или MANUAL)
-        """
-        if self.is_recording:
-            return
-        
-        # Запоминаем сегменты буфера (до начала записи)
-        if rec_type == RecordingType.MOTION:
-            self.buffer_segments = self.segment_recorder.get_recent_segments(
-                self.buffer_seconds
+        """Начать запись видео."""
+        with self.recording_lock:
+            if self.is_recording:
+                return
+            
+            # Проверяем что FFmpeg пишет свежие сегменты
+            if not self._check_segments_fresh(max_age=10.0):
+                self.logger.warning("⚠️ Segments are stale! Skipping recording.")
+                return
+            
+            current_time = time.time()
+            
+            # Помечаем что запись началась СРАЗУ (до логирования)
+            self.is_recording = True
+            self.recording_type = rec_type
+            
+            # Приостанавливаем cleanup
+            self.segment_recorder.pause_cleanup()
+            
+            # Запоминаем временные метки
+            if rec_type == RecordingType.MOTION:
+                self.recording_buffer_start_time = current_time - self.buffer_seconds
+            else:
+                self.recording_buffer_start_time = current_time
+            
+            self.recording_start_time = current_time
+            
+            type_str = "🐦 MOTION" if rec_type == RecordingType.MOTION else "🎬 MANUAL"
+            self.logger.info(
+                f"▶ {type_str} recording started "
+                f"(buffer from {self.buffer_seconds}s ago)"
             )
-        else:
-            self.buffer_segments = []
-        
-        self.is_recording = True
-        self.recording_type = rec_type
-        self.recording_start_time = time.time()
-        self.recording_segments_start = time.time()
-        
-        type_str = "🐦 MOTION" if rec_type == RecordingType.MOTION else "🎬 MANUAL"
-        buffer_info = f", buffer: {len(self.buffer_segments)} segments" if self.buffer_segments else ""
-        self.logger.info(f"▶ {type_str} recording started{buffer_info}")
     
     def stop_recording(self):
         """Остановить запись и сохранить видео."""
-        if not self.is_recording:
-            return
+        with self.recording_lock:
+            if not self.is_recording:
+                return
+            # Помечаем сразу что не записываем (чтобы не вызвали повторно)
+            was_recording_type = self.recording_type
+            self.is_recording = False
         
-        # Собираем сегменты с момента начала записи
-        new_segments = self.segment_recorder.get_all_segments_since(
-            self.recording_segments_start
+        # Остальная работа вне блокировки (занимает время)
+        
+        # Ждём пока FFmpeg допишет последние сегменты
+        # (post_motion_seconds уже прошли, нужно только дождаться финализации)
+        wait_time = self.segment_duration + 1
+        self.logger.info(f"Finalizing recording ({wait_time}s)...")
+        time.sleep(wait_time)
+        
+        # Время окончания = СЕЙЧАС (после ожидания), чтобы включить все сегменты
+        recording_end_time = time.time()
+        
+        # Получаем сегменты в нужном временном диапазоне
+        segments = self.segment_recorder.get_segments_in_time_range(
+            start_time=self.recording_buffer_start_time,
+            end_time=recording_end_time
         )
         
-        # Объединяем буфер + новые сегменты
-        all_segments = self.buffer_segments + new_segments
+        expected_duration = recording_end_time - self.recording_buffer_start_time
+        actual_duration = len(segments) * self.segment_duration
         
-        # Убираем дубликаты, сохраняя порядок
-        seen = set()
-        unique_segments = []
-        for seg in all_segments:
-            if seg not in seen:
-                seen.add(seg)
-                unique_segments.append(seg)
+        self.logger.info(
+            f"Segments: {len(segments)} (~{actual_duration}s), "
+            f"expected: {expected_duration:.1f}s"
+        )
         
-        if not unique_segments:
-            self.logger.warning("No segments to save")
+        if not segments:
+            self.logger.warning("No segments found for recording")
+            self._reset_recording_state()
+            return
+        
+        # Проверяем что сегменты действительно свежие
+        newest_segment_time = max(os.path.getmtime(s) for s in segments)
+        if newest_segment_time < self.recording_start_time - 5:
+            self.logger.warning(
+                f"⚠️ Segments are stale! Newest: {newest_segment_time:.0f}, "
+                f"recording started: {self.recording_start_time:.0f}"
+            )
             self._reset_recording_state()
             return
         
         # Формируем имя файла
         now = self.get_moscow_time()
         timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
-        duration = time.time() - self.recording_start_time
-        duration_str = self.format_duration(duration)
         
-        if self.recording_type == RecordingType.MOTION:
+        if was_recording_type == RecordingType.MOTION:
             prefix = "bird"
             output_folder = self.motion_dir
             self.stats['motion_videos_saved'] += 1
@@ -523,16 +774,49 @@ class MotionDetector:
             self.stats['manual_videos_saved'] += 1
             type_str = "🎬 MANUAL"
         
-        filename = f"{prefix}_{timestamp}_{duration_str}.mp4"
-        filepath = os.path.join(output_folder, filename)
+        # Временный файл
+        temp_filepath = os.path.join(output_folder, f"{prefix}_{timestamp}_temp.mp4")
         
         # Объединяем сегменты
-        self.logger.info(f"Merging {len(unique_segments)} segments...")
+        self.logger.info(f"Merging {len(segments)} segments...")
         
-        if self.video_merger.merge_segments(unique_segments, filepath):
-            self.logger.info(f"■ {type_str} recording saved: {filename} ({duration:.1f}s)")
+        if self.video_merger.merge_segments(segments, temp_filepath):
+            # Проверяем что файл реально создался
+            if not os.path.exists(temp_filepath):
+                self.logger.error(f"Merge reported success but file not found: {temp_filepath}")
+                self._reset_recording_state()
+                return
+            
+            # Получаем точную длительность
+            real_duration = get_video_duration(temp_filepath)
+            
+            if real_duration > 0:
+                duration_str = self.format_duration(real_duration)
+                final_filename = f"{prefix}_{timestamp}_{duration_str}.mp4"
+                final_filepath = os.path.join(output_folder, final_filename)
+                
+                try:
+                    os.rename(temp_filepath, final_filepath)
+                    self.logger.info(
+                        f"■ {type_str} saved: {final_filename} "
+                        f"(duration: {real_duration:.1f}s)"
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to rename: {e}")
+                    # Файл существует - просто используем temp имя
+                    if os.path.exists(temp_filepath):
+                        self.logger.info(f"■ {type_str} saved: {prefix}_{timestamp}_temp.mp4")
+            else:
+                self.logger.warning("Could not get duration")
+                self.logger.info(f"■ {type_str} saved: {prefix}_{timestamp}_temp.mp4")
         else:
-            self.logger.error(f"Failed to save recording: {filename}")
+            self.logger.error("Failed to merge segments")
+            # Удаляем пустой temp файл если есть
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except Exception:
+                    pass
         
         self._reset_recording_state()
     
@@ -541,17 +825,40 @@ class MotionDetector:
         self.is_recording = False
         self.recording_type = RecordingType.NONE
         self.recording_start_time = None
-        self.recording_segments_start = None
-        self.buffer_segments = []
+        self.recording_buffer_start_time = None
+        
+        # Возобновляем cleanup
+        self.segment_recorder.resume_cleanup()
     
     def process_frame(self, frame: np.ndarray):
         """Обработка одного кадра."""
         current_time = time.time()
         
         # Детекция движения
-        motion, motion_percent = self.detect_motion(frame)
+        significant_motion, motion_percent = self.detect_motion(frame)
         
-        if motion:
+        # Любое движение выше порога продлевает запись
+        any_motion = motion_percent >= self.extend_motion_percent
+        
+        # DEBUG: логируем движение во время записи
+        if self.debug_motion and self.is_recording:
+            # Логируем каждую секунду чтобы не спамить
+            if not hasattr(self, '_last_debug_log') or \
+               current_time - self._last_debug_log >= 1.0:
+                self._last_debug_log = current_time
+                time_since = current_time - self.last_motion_time
+                status = "📍" if any_motion else "⚪"
+                self.logger.debug(
+                    f"{status} Motion: {motion_percent:.2f}% "
+                    f"(extend threshold: {self.extend_motion_percent}%), "
+                    f"time since last: {time_since:.1f}s"
+                )
+        
+        # Обновляем время последнего движения при ЛЮБОМ движении выше порога
+        if any_motion and self.significant_motion_started:
+            self.last_motion_time = current_time
+        
+        if significant_motion:
             self.consecutive_motion_frames += 1
             self.stats['motion_events'] += 1
             
@@ -568,21 +875,39 @@ class MotionDetector:
                         f"event #{self.stats['significant_motion_events']})"
                     )
                     
-                    # Начинаем MOTION запись если включена авто-детекция
+                    # Начинаем MOTION запись
                     if self.motion_detection_enabled and not self.is_recording:
                         self.start_recording(RecordingType.MOTION)
         else:
             self.consecutive_motion_frames = 0
         
-        # Проверяем окончание движения (только для MOTION записи)
+        # Проверяем окончание движения
         if self.significant_motion_started:
             time_since_last_motion = current_time - self.last_motion_time
             
+            # DEBUG: показываем обратный отсчёт перед остановкой
+            if self.debug_motion and time_since_last_motion > 1.0:
+                remaining = self.post_motion_seconds - time_since_last_motion
+                if remaining > 0 and int(remaining) != getattr(self, '_last_countdown', -1):
+                    self._last_countdown = int(remaining)
+                    self.logger.info(
+                        f"   ⏳ No motion for {time_since_last_motion:.1f}s, "
+                        f"stopping in {remaining:.0f}s..."
+                    )
+            
+            # Движение прекратилось, ждём post_motion_seconds
             if time_since_last_motion > self.post_motion_seconds:
                 self.significant_motion_started = False
+                self._last_countdown = -1  # Reset countdown
+                
+                total_recording_time = current_time - self.recording_start_time \
+                    if self.recording_start_time else 0
+                
                 self.logger.info(
-                    f"   Motion ended. {self.post_motion_seconds}s buffer recorded."
+                    f"   ⏹ Motion stopped. Recorded {total_recording_time:.1f}s total "
+                    f"(incl. {self.post_motion_seconds}s post-buffer)"
                 )
+                
                 # Останавливаем только MOTION запись
                 if self.is_recording and self.recording_type == RecordingType.MOTION:
                     self.stop_recording()
@@ -604,7 +929,7 @@ class MotionDetector:
         self.logger.info("⏹ MOTION detection DISABLED")
     
     def start_manual_recording(self):
-        """Начать принудительную запись (ручной режим)."""
+        """Начать принудительную запись."""
         if self.is_recording:
             if self.recording_type == RecordingType.MANUAL:
                 self.logger.warning("Manual recording already in progress")
@@ -637,7 +962,11 @@ class MotionDetector:
         """Основной цикл обработки."""
         # Запускаем запись сегментов
         self.segment_recorder.start()
-        time.sleep(2)  # Даём время FFmpeg стартовать
+        
+        # Ждём пока накопятся сегменты для буфера
+        wait_for_buffer = self.buffer_seconds + 2
+        self.logger.info(f"Waiting {wait_for_buffer}s for buffer to fill...")
+        time.sleep(wait_for_buffer)
         
         # Подключаемся к потоку для анализа
         if not self.connect():
@@ -698,16 +1027,7 @@ class MotionDetector:
 
 
 def monitor_control_file(detector: MotionDetector, control_file: str):
-    """
-    Мониторит файл управления.
-    
-    Команды:
-    - MOTION_ON   — включить авто-запись при движении
-    - MOTION_OFF  — выключить авто-запись при движении
-    - RECORD_START — начать принудительную (ручную) запись
-    - RECORD_STOP  — остановить принудительную запись
-    - STATUS       — показать статус
-    """
+    """Мониторит файл управления."""
     logger = detector.logger
     logger.info(f"Control file: {control_file}")
     logger.info("Commands: MOTION_ON, MOTION_OFF, RECORD_START, RECORD_STOP, STATUS")
@@ -740,37 +1060,30 @@ def monitor_control_file(detector: MotionDetector, control_file: str):
 
 
 def load_config(config_path: str = None) -> dict:
-    """
-    Загрузка конфигурации из файла.
-    
-    Приоритет:
-    1. Файл config.env (высший приоритет, для dev-режима)
-    2. Переменные окружения (для Docker без config.env)
-    3. Значения по умолчанию
-    """
+    """Загрузка конфигурации из файла."""
     defaults = {
-        "RTMP_URL": "rtmp://nginx-rtmp/live",
-        "OUTPUT_DIR": "/recordings",
-        "LOG_FILE": "/logs/motion_detector.log",
-        "CONTROL_FILE": "/tmp/control/command",
-        "BUFFER_SECONDS": "5",
-        "POST_MOTION_SECONDS": "5",
-        "MIN_CONTOUR_AREA": "500",
-        "MIN_MOTION_FRAMES": "3",
-        "MOTION_AREA_PERCENT": "0.5",
-        "AUTO_START_MOTION": "false",
-        "SEGMENT_DURATION": "2",
+        "RTMP_URL": DEFAULT_RTMP_URL,
+        "OUTPUT_DIR": DEFAULT_OUTPUT_DIR,
+        "LOG_FILE": DEFAULT_LOG_FILE,
+        "CONTROL_FILE": DEFAULT_CONTROL_FILE,
+        "BUFFER_SECONDS": str(DEFAULT_BUFFER_SECONDS),
+        "POST_MOTION_SECONDS": str(DEFAULT_POST_MOTION_SECONDS),
+        "MIN_CONTOUR_AREA": str(DEFAULT_MIN_CONTOUR_AREA),
+        "MIN_MOTION_FRAMES": str(DEFAULT_MIN_MOTION_FRAMES),
+        "MOTION_AREA_PERCENT": str(DEFAULT_MOTION_AREA_PERCENT),
+        "AUTO_START_MOTION": str(DEFAULT_AUTO_START_MOTION).lower(),
+        "SEGMENT_DURATION": str(DEFAULT_SEGMENT_DURATION),
+        "EXTEND_MOTION_PERCENT": str(DEFAULT_EXTEND_MOTION_PERCENT),
+        "DEBUG_MOTION": str(DEFAULT_DEBUG_MOTION).lower(),
     }
     
     config = defaults.copy()
     
-    # Сначала применяем переменные окружения
     for key in config:
         env_value = os.environ.get(key)
         if env_value is not None:
             config[key] = env_value
     
-    # Ищем config.env в разных местах
     if config_path is None:
         possible_paths = [
             "/app/config.env",
@@ -782,7 +1095,6 @@ def load_config(config_path: str = None) -> dict:
                 config_path = path
                 break
     
-    # Файл config.env имеет ВЫСШИЙ приоритет
     if config_path and os.path.exists(config_path):
         print(f"📋 Loading config from: {config_path}")
         with open(config_path, 'r') as f:
@@ -807,9 +1119,11 @@ def main():
     min_contour_area = int(config["MIN_CONTOUR_AREA"])
     min_motion_frames = int(config["MIN_MOTION_FRAMES"])
     motion_area_percent = float(config["MOTION_AREA_PERCENT"])
+    extend_motion_percent = float(config["EXTEND_MOTION_PERCENT"])
+    debug_motion = config["DEBUG_MOTION"].lower() == "true"
     auto_start_motion = config["AUTO_START_MOTION"].lower() == "true"
     control_file = config["CONTROL_FILE"]
-    segment_duration = int(config.get("SEGMENT_DURATION", "2"))
+    segment_duration = int(config.get("SEGMENT_DURATION", "1"))
     
     detector = MotionDetector(
         rtmp_url=rtmp_url,
@@ -820,6 +1134,8 @@ def main():
         min_contour_area=min_contour_area,
         min_motion_frames=min_motion_frames,
         motion_area_percent=motion_area_percent,
+        extend_motion_percent=extend_motion_percent,
+        debug_motion=debug_motion,
         segment_duration=segment_duration
     )
     

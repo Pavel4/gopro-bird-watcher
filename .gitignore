@@ -19,6 +19,7 @@ venv/
 recordings/motion/*.mp4
 recordings/manual/*.mp4
 recordings/.segments/
+recordings/.recording/
 
 # Logs
 logs/*.log
