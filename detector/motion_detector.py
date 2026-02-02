@@ -40,6 +40,13 @@ DEFAULT_SEGMENT_DURATION = 1
 DEFAULT_AUTO_START_MOTION = False
 DEFAULT_DEBUG_MOTION = False
 
+# ROI (Region of Interest) - область кормушки
+DEFAULT_ROI_ENABLED = False
+DEFAULT_ROI_X = 0
+DEFAULT_ROI_Y = 0
+DEFAULT_ROI_WIDTH = 0   # 0 = весь кадр
+DEFAULT_ROI_HEIGHT = 0  # 0 = весь кадр
+
 
 class RecordingType(Enum):
     """Тип записи."""
@@ -421,8 +428,23 @@ class VideoMerger:
     def __init__(self, logger: logging.Logger = None):
         self.logger = logger or logging.getLogger(__name__)
     
-    def merge_segments(self, segments: list, output_path: str) -> bool:
-        """Объединить сегменты в один файл."""
+    def merge_segments(
+        self, 
+        segments: list, 
+        output_path: str,
+        crop_params: tuple = None
+    ) -> bool:
+        """
+        Объединить сегменты в один файл.
+        
+        Args:
+            segments: Список путей к сегментам
+            output_path: Путь для выходного файла
+            crop_params: Кортеж (x, y, width, height) для обрезки или None
+        
+        Returns:
+            True если успешно
+        """
         if not segments:
             self.logger.error("No segments to merge")
             return False
@@ -455,20 +477,41 @@ class VideoMerger:
                     escaped_path = abs_path.replace("'", "'\\''")
                     f.write(f"file '{escaped_path}'\n")
             
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_file,
-                "-c", "copy",
-                output_path
-            ]
+            # Базовая команда
+            if crop_params:
+                # С обрезкой - нужно перекодировать видео
+                x, y, w, h = crop_params
+                self.logger.info(f"Applying crop: {w}x{h} at ({x}, {y})")
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", list_file,
+                    "-vf", f"crop={w}:{h}:{x}:{y}",
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "23",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    output_path
+                ]
+            else:
+                # Без обрезки - просто копируем потоки
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", list_file,
+                    "-c", "copy",
+                    output_path
+                ]
             
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=120
+                timeout=300  # Увеличен таймаут для перекодирования
             )
             
             success = result.returncode == 0 and os.path.exists(output_path)
@@ -527,7 +570,12 @@ class MotionDetector:
         motion_area_percent: float = DEFAULT_MOTION_AREA_PERCENT,
         extend_motion_percent: float = DEFAULT_EXTEND_MOTION_PERCENT,
         debug_motion: bool = DEFAULT_DEBUG_MOTION,
-        segment_duration: int = DEFAULT_SEGMENT_DURATION
+        segment_duration: int = DEFAULT_SEGMENT_DURATION,
+        roi_enabled: bool = DEFAULT_ROI_ENABLED,
+        roi_x: int = DEFAULT_ROI_X,
+        roi_y: int = DEFAULT_ROI_Y,
+        roi_width: int = DEFAULT_ROI_WIDTH,
+        roi_height: int = DEFAULT_ROI_HEIGHT
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -539,6 +587,13 @@ class MotionDetector:
         self.extend_motion_percent = extend_motion_percent
         self.debug_motion = debug_motion
         self.segment_duration = segment_duration
+        
+        # ROI (Region of Interest) - область кормушки
+        self.roi_enabled = roi_enabled
+        self.roi_x = roi_x
+        self.roi_y = roi_y
+        self.roi_width = roi_width
+        self.roi_height = roi_height
         
         # Логирование
         self.logger = setup_logging(log_file)
@@ -608,6 +663,18 @@ class MotionDetector:
         )
         if debug_motion:
             self.logger.info(f"  DEBUG MODE: motion % will be logged")
+        
+        # Логируем настройки ROI
+        if self.roi_enabled and self.roi_width > 0 and self.roi_height > 0:
+            self.logger.info(
+                f"  🎯 ROI ENABLED: {self.roi_width}x{self.roi_height} "
+                f"at ({self.roi_x}, {self.roi_y})"
+            )
+            self.logger.info(
+                f"     Motion detection and video crop will use ROI area only"
+            )
+        else:
+            self.logger.info(f"  ROI disabled - using full frame")
     
     def get_moscow_time(self) -> datetime:
         """Получить текущее время по Москве."""
@@ -642,8 +709,25 @@ class MotionDetector:
         return True
     
     def detect_motion(self, frame: np.ndarray) -> tuple:
-        """Детекция движения в кадре."""
-        fg_mask = self.background_subtractor.apply(frame)
+        """
+        Детекция движения в кадре.
+        
+        Если ROI включен - анализируется только область интереса.
+        """
+        # Определяем область для анализа
+        if self.roi_enabled and self.roi_width > 0 and self.roi_height > 0:
+            # Обрезаем кадр до ROI области
+            roi_frame = frame[
+                self.roi_y:self.roi_y + self.roi_height,
+                self.roi_x:self.roi_x + self.roi_width
+            ]
+            analysis_frame = roi_frame
+            analysis_area = self.roi_width * self.roi_height
+        else:
+            analysis_frame = frame
+            analysis_area = self.frame_area
+        
+        fg_mask = self.background_subtractor.apply(analysis_frame)
         
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
@@ -659,7 +743,7 @@ class MotionDetector:
             if area > self.min_contour_area:
                 total_motion_area += area
         
-        motion_percent = (total_motion_area / self.frame_area) * 100 if self.frame_area else 0
+        motion_percent = (total_motion_area / analysis_area) * 100 if analysis_area else 0
         motion_detected = motion_percent >= self.motion_area_percent
         
         return motion_detected, motion_percent
@@ -777,10 +861,15 @@ class MotionDetector:
         # Временный файл
         temp_filepath = os.path.join(output_folder, f"{prefix}_{timestamp}_temp.mp4")
         
+        # Определяем параметры crop (если ROI включен)
+        crop_params = None
+        if self.roi_enabled and self.roi_width > 0 and self.roi_height > 0:
+            crop_params = (self.roi_x, self.roi_y, self.roi_width, self.roi_height)
+        
         # Объединяем сегменты
         self.logger.info(f"Merging {len(segments)} segments...")
         
-        if self.video_merger.merge_segments(segments, temp_filepath):
+        if self.video_merger.merge_segments(segments, temp_filepath, crop_params):
             # Проверяем что файл реально создался
             if not os.path.exists(temp_filepath):
                 self.logger.error(f"Merge reported success but file not found: {temp_filepath}")
@@ -950,11 +1039,22 @@ class MotionDetector:
     
     def get_status(self) -> dict:
         """Получить текущий статус."""
+        roi_info = None
+        if self.roi_enabled and self.roi_width > 0 and self.roi_height > 0:
+            roi_info = {
+                'enabled': True,
+                'x': self.roi_x,
+                'y': self.roi_y,
+                'width': self.roi_width,
+                'height': self.roi_height
+            }
+        
         return {
             'motion_detection_enabled': self.motion_detection_enabled,
             'is_recording': self.is_recording,
             'recording_type': self.recording_type.value,
             'segment_recorder_running': self.segment_recorder.is_running,
+            'roi': roi_info,
             'stats': self.stats
         }
     
@@ -1075,6 +1175,12 @@ def load_config(config_path: str = None) -> dict:
         "SEGMENT_DURATION": str(DEFAULT_SEGMENT_DURATION),
         "EXTEND_MOTION_PERCENT": str(DEFAULT_EXTEND_MOTION_PERCENT),
         "DEBUG_MOTION": str(DEFAULT_DEBUG_MOTION).lower(),
+        # ROI параметры
+        "ROI_ENABLED": str(DEFAULT_ROI_ENABLED).lower(),
+        "ROI_X": str(DEFAULT_ROI_X),
+        "ROI_Y": str(DEFAULT_ROI_Y),
+        "ROI_WIDTH": str(DEFAULT_ROI_WIDTH),
+        "ROI_HEIGHT": str(DEFAULT_ROI_HEIGHT),
     }
     
     config = defaults.copy()
@@ -1125,6 +1231,13 @@ def main():
     control_file = config["CONTROL_FILE"]
     segment_duration = int(config.get("SEGMENT_DURATION", "1"))
     
+    # ROI параметры
+    roi_enabled = config.get("ROI_ENABLED", "false").lower() == "true"
+    roi_x = int(config.get("ROI_X", "0"))
+    roi_y = int(config.get("ROI_Y", "0"))
+    roi_width = int(config.get("ROI_WIDTH", "0"))
+    roi_height = int(config.get("ROI_HEIGHT", "0"))
+    
     detector = MotionDetector(
         rtmp_url=rtmp_url,
         output_dir=output_dir,
@@ -1136,7 +1249,12 @@ def main():
         motion_area_percent=motion_area_percent,
         extend_motion_percent=extend_motion_percent,
         debug_motion=debug_motion,
-        segment_duration=segment_duration
+        segment_duration=segment_duration,
+        roi_enabled=roi_enabled,
+        roi_x=roi_x,
+        roi_y=roi_y,
+        roi_width=roi_width,
+        roi_height=roi_height
     )
     
     def signal_handler(sig, frame):
