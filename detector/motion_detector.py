@@ -47,6 +47,12 @@ DEFAULT_ROI_Y = 0
 DEFAULT_ROI_WIDTH = 0   # 0 = весь кадр
 DEFAULT_ROI_HEIGHT = 0  # 0 = весь кадр
 
+# USB Webcam режим (альтернатива RTMP)
+DEFAULT_INPUT_SOURCE = "rtmp"  # "rtmp" или "usb"
+DEFAULT_USB_DEVICE = "/dev/video0"
+DEFAULT_USB_RESOLUTION = "1080"  # 480, 720, 1080
+DEFAULT_USB_FPS = 30
+
 
 class RecordingType(Enum):
     """Тип записи."""
@@ -74,23 +80,34 @@ def setup_logging(log_file: str = None):
 
 class SegmentRecorder:
     """
-    Записывает RTMP поток короткими сегментами через FFmpeg.
+    Записывает видеопоток короткими сегментами через FFmpeg.
+    Поддерживает RTMP и USB (V4L2) источники.
     Сегменты именуются с timestamp для точного выбора по времени.
     """
     
     def __init__(
         self,
-        rtmp_url: str,
+        source_url: str,
         segments_dir: str,
         segment_duration: int = 1,
         max_segments: int = 180,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        input_source: str = "rtmp",
+        usb_device: str = "/dev/video0",
+        usb_resolution: str = "1080",
+        usb_fps: int = 30
     ):
-        self.rtmp_url = rtmp_url
+        self.source_url = source_url  # RTMP URL или USB device path
         self.segments_dir = segments_dir
         self.segment_duration = segment_duration
         self.max_segments = max_segments
         self.logger = logger or logging.getLogger(__name__)
+        
+        # Режим работы: rtmp или usb
+        self.input_source = input_source.lower()
+        self.usb_device = usb_device
+        self.usb_resolution = usb_resolution
+        self.usb_fps = usb_fps
         
         self.ffmpeg_process = None
         self.is_running = False
@@ -103,7 +120,9 @@ class SegmentRecorder:
         # Очищаем и создаём папку сегментов
         self._clean_segments_dir()
         
+        source_info = self.usb_device if self.input_source == "usb" else self.source_url
         self.logger.info(f"SegmentRecorder initialized: {segments_dir}")
+        self.logger.info(f"  Input source: {self.input_source.upper()} ({source_info})")
     
     def _kill_existing_ffmpeg(self):
         """Убить все существующие FFmpeg процессы записи сегментов."""
@@ -156,21 +175,57 @@ class SegmentRecorder:
         """Внутренний метод запуска FFmpeg процесса."""
         segment_pattern = os.path.join(self.segments_dir, "seg_%Y%m%d_%H%M%S.ts")
         
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loglevel", "warning",
-            "-i", self.rtmp_url,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-f", "segment",
-            "-segment_time", str(self.segment_duration),
-            "-segment_format", "mpegts",
-            "-segment_atclocktime", "1",
-            "-reset_timestamps", "1",
-            "-strftime", "1",
-            segment_pattern
-        ]
+        if self.input_source == "usb":
+            # USB/V4L2 режим - захват с веб-камеры
+            # Определяем разрешение
+            resolution_map = {
+                "480": "854x480",
+                "720": "1280x720",
+                "1080": "1920x1080"
+            }
+            resolution = resolution_map.get(self.usb_resolution, "1280x720")
+            
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "warning",
+                # Входные параметры для V4L2
+                "-f", "v4l2",
+                "-input_format", "mjpeg",  # GoPro в режиме webcam использует MJPEG
+                "-video_size", resolution,
+                "-framerate", str(self.usb_fps),
+                "-i", self.usb_device,
+                # Кодирование
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", "23",
+                # Сегментация
+                "-f", "segment",
+                "-segment_time", str(self.segment_duration),
+                "-segment_format", "mpegts",
+                "-segment_atclocktime", "1",
+                "-reset_timestamps", "1",
+                "-strftime", "1",
+                segment_pattern
+            ]
+        else:
+            # RTMP режим - копируем поток
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "warning",
+                "-i", self.source_url,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-f", "segment",
+                "-segment_time", str(self.segment_duration),
+                "-segment_format", "mpegts",
+                "-segment_atclocktime", "1",
+                "-reset_timestamps", "1",
+                "-strftime", "1",
+                segment_pattern
+            ]
         
         self.ffmpeg_process = subprocess.Popen(
             cmd,
@@ -575,7 +630,11 @@ class MotionDetector:
         roi_x: int = DEFAULT_ROI_X,
         roi_y: int = DEFAULT_ROI_Y,
         roi_width: int = DEFAULT_ROI_WIDTH,
-        roi_height: int = DEFAULT_ROI_HEIGHT
+        roi_height: int = DEFAULT_ROI_HEIGHT,
+        input_source: str = DEFAULT_INPUT_SOURCE,
+        usb_device: str = DEFAULT_USB_DEVICE,
+        usb_resolution: str = DEFAULT_USB_RESOLUTION,
+        usb_fps: int = DEFAULT_USB_FPS
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -595,6 +654,12 @@ class MotionDetector:
         self.roi_width = roi_width
         self.roi_height = roi_height
         
+        # USB режим
+        self.input_source = input_source.lower()
+        self.usb_device = usb_device
+        self.usb_resolution = usb_resolution
+        self.usb_fps = usb_fps
+        
         # Логирование
         self.logger = setup_logging(log_file)
         
@@ -607,11 +672,15 @@ class MotionDetector:
         
         # Компоненты записи
         self.segment_recorder = SegmentRecorder(
-            rtmp_url=rtmp_url,
+            source_url=rtmp_url,
             segments_dir=self.segments_dir,
             segment_duration=segment_duration,
             max_segments=300,  # ~5 минут буфера
-            logger=self.logger
+            logger=self.logger,
+            input_source=self.input_source,
+            usb_device=self.usb_device,
+            usb_resolution=self.usb_resolution,
+            usb_fps=self.usb_fps
         )
         self.video_merger = VideoMerger(logger=self.logger)
         
@@ -653,7 +722,7 @@ class MotionDetector:
             'last_motion': None
         }
         
-        self.logger.info(f"Motion detector initialized (with audio support)")
+        self.logger.info(f"Motion detector initialized")
         self.logger.info(f"  Output dirs: motion={self.motion_dir}, manual={self.manual_dir}")
         self.logger.info(f"  Buffer: {buffer_seconds}s before, {post_motion_seconds}s after")
         self.logger.info(f"  Segment duration: {segment_duration}s")
@@ -661,6 +730,14 @@ class MotionDetector:
             f"  Motion thresholds: start={motion_area_percent}%, "
             f"extend={extend_motion_percent}%"
         )
+        
+        # Логируем режим ввода
+        if self.input_source == "usb":
+            self.logger.info(f"  📹 INPUT: USB Webcam ({self.usb_device})")
+            self.logger.info(f"     Resolution: {self.usb_resolution}p @ {self.usb_fps}fps")
+        else:
+            self.logger.info(f"  📡 INPUT: RTMP ({self.rtmp_url})")
+        
         if debug_motion:
             self.logger.info(f"  DEBUG MODE: motion % will be logged")
         
@@ -687,7 +764,58 @@ class MotionDetector:
         return f"{minutes:02d}m{secs:02d}s"
     
     def connect(self) -> bool:
-        """Подключение к RTMP потоку для анализа."""
+        """Подключение к видеоисточнику (RTMP или USB) для анализа."""
+        if self.input_source == "usb":
+            return self._connect_usb()
+        else:
+            return self._connect_rtmp()
+    
+    def _connect_usb(self) -> bool:
+        """Подключение к USB веб-камере."""
+        self.logger.info(f"Connecting to USB device {self.usb_device}...")
+        
+        # Пробуем сначала по пути устройства
+        if self.usb_device.startswith("/dev/video"):
+            device_index = int(self.usb_device.replace("/dev/video", ""))
+            self.cap = cv2.VideoCapture(device_index)
+        else:
+            self.cap = cv2.VideoCapture(self.usb_device)
+        
+        if not self.cap.isOpened():
+            self.logger.error(f"Failed to open USB device {self.usb_device}")
+            return False
+        
+        # Устанавливаем разрешение
+        resolution_map = {
+            "480": (854, 480),
+            "720": (1280, 720),
+            "1080": (1920, 1080)
+        }
+        width, height = resolution_map.get(self.usb_resolution, (1280, 720))
+        
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.usb_fps)
+        
+        # Устанавливаем формат MJPEG для GoPro
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        
+        # Буфер минимальный для снижения задержки
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Получаем реальные параметры
+        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or self.usb_fps
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.frame_area = self.frame_width * self.frame_height
+        
+        self.logger.info(
+            f"USB connected: {self.frame_width}x{self.frame_height} @ {self.fps}fps"
+        )
+        return True
+    
+    def _connect_rtmp(self) -> bool:
+        """Подключение к RTMP потоку."""
         self.logger.info(f"Connecting to {self.rtmp_url}...")
         
         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp'
@@ -704,7 +832,7 @@ class MotionDetector:
         self.frame_area = self.frame_width * self.frame_height
         
         self.logger.info(
-            f"Connected: {self.frame_width}x{self.frame_height} @ {self.fps}fps"
+            f"RTMP connected: {self.frame_width}x{self.frame_height} @ {self.fps}fps"
         )
         return True
     
@@ -1049,11 +1177,19 @@ class MotionDetector:
                 'height': self.roi_height
             }
         
+        input_info = {
+            'source': self.input_source,
+            'device': self.usb_device if self.input_source == 'usb' else self.rtmp_url,
+            'resolution': f"{self.frame_width}x{self.frame_height}",
+            'fps': self.fps
+        }
+        
         return {
             'motion_detection_enabled': self.motion_detection_enabled,
             'is_recording': self.is_recording,
             'recording_type': self.recording_type.value,
             'segment_recorder_running': self.segment_recorder.is_running,
+            'input': input_info,
             'roi': roi_info,
             'stats': self.stats
         }
@@ -1181,6 +1317,11 @@ def load_config(config_path: str = None) -> dict:
         "ROI_Y": str(DEFAULT_ROI_Y),
         "ROI_WIDTH": str(DEFAULT_ROI_WIDTH),
         "ROI_HEIGHT": str(DEFAULT_ROI_HEIGHT),
+        # USB параметры
+        "INPUT_SOURCE": DEFAULT_INPUT_SOURCE,
+        "USB_DEVICE": DEFAULT_USB_DEVICE,
+        "USB_RESOLUTION": DEFAULT_USB_RESOLUTION,
+        "USB_FPS": str(DEFAULT_USB_FPS),
     }
     
     config = defaults.copy()
@@ -1238,6 +1379,12 @@ def main():
     roi_width = int(config.get("ROI_WIDTH", "0"))
     roi_height = int(config.get("ROI_HEIGHT", "0"))
     
+    # USB параметры
+    input_source = config.get("INPUT_SOURCE", "rtmp").lower()
+    usb_device = config.get("USB_DEVICE", "/dev/video0")
+    usb_resolution = config.get("USB_RESOLUTION", "1080")
+    usb_fps = int(config.get("USB_FPS", "30"))
+    
     detector = MotionDetector(
         rtmp_url=rtmp_url,
         output_dir=output_dir,
@@ -1254,7 +1401,11 @@ def main():
         roi_x=roi_x,
         roi_y=roi_y,
         roi_width=roi_width,
-        roi_height=roi_height
+        roi_height=roi_height,
+        input_source=input_source,
+        usb_device=usb_device,
+        usb_resolution=usb_resolution,
+        usb_fps=usb_fps
     )
     
     def signal_handler(sig, frame):
