@@ -17,10 +17,30 @@ import sys
 import subprocess
 import shutil
 import glob
+import platform
+import asyncio
 from datetime import datetime, timezone, timedelta
 from threading import Thread, Event, Lock
 from enum import Enum
 import logging
+
+# Локальные модули
+try:
+    from storage_manager import StorageManager
+except ImportError:
+    # Если запускаем из другой директории
+    try:
+        from detector.storage_manager import StorageManager
+    except ImportError:
+        StorageManager = None  # Будет работать без управления хранилищем
+
+try:
+    from telegram_bot import TelegramNotifier
+except ImportError:
+    try:
+        from detector.telegram_bot import TelegramNotifier
+    except ImportError:
+        TelegramNotifier = None  # Будет работать без Telegram
 
 # Московское время (UTC+3)
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -53,6 +73,20 @@ DEFAULT_USB_DEVICE = "/dev/video0"
 DEFAULT_USB_RESOLUTION = "1080"  # 480, 720, 1080
 DEFAULT_USB_FPS = 30
 
+# Управление хранилищем
+DEFAULT_MAX_RECORDING_AGE_DAYS = 30
+DEFAULT_MIN_FREE_SPACE_GB = 10.0
+DEFAULT_AUTO_CLEANUP_ENABLED = True
+DEFAULT_CLEANUP_INTERVAL_HOURS = 1
+
+# Telegram бот
+DEFAULT_TELEGRAM_ENABLED = False
+DEFAULT_TELEGRAM_BOT_TOKEN = ""
+DEFAULT_TELEGRAM_CHAT_ID = ""
+DEFAULT_TELEGRAM_SEND_ON_MOTION = True
+DEFAULT_TELEGRAM_SEND_MANUAL = False
+DEFAULT_TELEGRAM_MAX_VIDEO_MB = 45.0
+
 
 class RecordingType(Enum):
     """Тип записи."""
@@ -69,9 +103,9 @@ def setup_logging(log_file: str = None):
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
     
-    # DEBUG уровень для отладки движения
+    # INFO уровень для чистых логов (DEBUG засоряет логи FFmpeg сообщениями)
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=handlers
     )
@@ -83,6 +117,9 @@ class SegmentRecorder:
     Записывает видеопоток короткими сегментами через FFmpeg.
     Поддерживает RTMP и USB (V4L2) источники.
     Сегменты именуются с timestamp для точного выбора по времени.
+    
+    ВАЖНО: На macOS сегментация не работает с AVFoundation,
+    поэтому используется прямая запись в один файл.
     """
     
     def __init__(
@@ -109,6 +146,10 @@ class SegmentRecorder:
         self.usb_resolution = usb_resolution
         self.usb_fps = usb_fps
         
+        # Определяем режим записи (сегменты или прямая запись)
+        system = platform.system()
+        self.use_segments = not (system == "Darwin" and input_source == "usb")
+        
         self.ffmpeg_process = None
         self.is_running = False
         self.stop_event = Event()
@@ -117,12 +158,18 @@ class SegmentRecorder:
         # Флаг для приостановки cleanup во время записи
         self.cleanup_paused = False
         
+        # Для режима без сегментов (macOS USB)
+        self.direct_output_file = None
+        self.recording_start_time = None
+        
         # Очищаем и создаём папку сегментов
         self._clean_segments_dir()
         
         source_info = self.usb_device if self.input_source == "usb" else self.source_url
+        mode = "segments" if self.use_segments else "direct"
         self.logger.info(f"SegmentRecorder initialized: {segments_dir}")
         self.logger.info(f"  Input source: {self.input_source.upper()} ({source_info})")
+        self.logger.info(f"  Recording mode: {mode}")
     
     def _kill_existing_ffmpeg(self):
         """Убить все существующие FFmpeg процессы записи сегментов."""
@@ -174,9 +221,10 @@ class SegmentRecorder:
     def _start_ffmpeg(self):
         """Внутренний метод запуска FFmpeg процесса."""
         segment_pattern = os.path.join(self.segments_dir, "seg_%Y%m%d_%H%M%S.ts")
+        system = platform.system()
         
         if self.input_source == "usb":
-            # USB/V4L2 режим - захват с веб-камеры
+            # USB режим - захват с веб-камеры (зависит от платформы)
             # Определяем разрешение
             resolution_map = {
                 "480": "854x480",
@@ -185,30 +233,82 @@ class SegmentRecorder:
             }
             resolution = resolution_map.get(self.usb_resolution, "1280x720")
             
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-loglevel", "warning",
-                # Входные параметры для V4L2
-                "-f", "v4l2",
-                "-input_format", "mjpeg",  # GoPro в режиме webcam использует MJPEG
-                "-video_size", resolution,
-                "-framerate", str(self.usb_fps),
-                "-i", self.usb_device,
-                # Кодирование
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-crf", "23",
-                # Сегментация
-                "-f", "segment",
-                "-segment_time", str(self.segment_duration),
-                "-segment_format", "mpegts",
-                "-segment_atclocktime", "1",
-                "-reset_timestamps", "1",
-                "-strftime", "1",
-                segment_pattern
-            ]
+            if system == "Darwin":  # macOS - используем AVFoundation
+                # Автоопределение GoPro для FFmpeg
+                ffmpeg_device = self.usb_device
+                if self.usb_device.lower() == "auto":
+                    gopro_index = detect_gopro_macos(self.logger)
+                    if gopro_index >= 0:
+                        ffmpeg_device = str(gopro_index)
+                        self.logger.info(
+                            f"🎯 FFmpeg: auto-detected GoPro at index {gopro_index}"
+                        )
+                    else:
+                        ffmpeg_device = "0"
+                        self.logger.warning(
+                            "FFmpeg: GoPro not found, falling back to device 0"
+                        )
+                
+                # macOS: Прямая запись без сегментации (AVFoundation не поддерживает)
+                self.logger.info(
+                    f"macOS: Using AVFoundation for direct capture "
+                    f"from device {ffmpeg_device}"
+                )
+                
+                # Временный файл для записи (будет переименован при финализации)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.direct_output_file = os.path.join(
+                    self.segments_dir, 
+                    f"temp_recording_{timestamp}.ts"
+                )
+                self.recording_start_time = time.time()
+                
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel", "warning",
+                    # Входные параметры для AVFoundation (macOS)
+                    "-f", "avfoundation",
+                    "-framerate", str(self.usb_fps),
+                    "-video_size", resolution,
+                    "-i", ffmpeg_device,  # Автоопределённый индекс GoPro
+                    # Кодирование (без сегментации)
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency",
+                    "-crf", "23",
+                    "-f", "mpegts",  # MPEG-TS формат
+                    self.direct_output_file
+                ]
+                self.logger.info(f"  Direct recording to: {self.direct_output_file}")
+                self.logger.warning(
+                    "  ⚠️  macOS mode: NO pre-buffer (recording starts from now)"
+                )
+            else:  # Linux - используем V4L2
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel", "warning",
+                    # Входные параметры для V4L2
+                    "-f", "v4l2",
+                    "-input_format", "mjpeg",
+                    "-video_size", resolution,
+                    "-framerate", str(self.usb_fps),
+                    "-i", self.usb_device,
+                    # Кодирование
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency",
+                    "-crf", "23",
+                    # Сегментация
+                    "-f", "segment",
+                    "-segment_time", str(self.segment_duration),
+                    "-segment_format", "mpegts",
+                    "-segment_atclocktime", "1",
+                    "-reset_timestamps", "1",
+                    "-strftime", "1",
+                    segment_pattern
+                ]
         else:
             # RTMP режим - копируем поток
             cmd = [
@@ -397,6 +497,10 @@ class SegmentRecorder:
     
     def _cleanup_old_segments(self):
         """Удаляет старые сегменты, оставляя последние max_segments."""
+        # Для режима прямой записи cleanup не нужен
+        if not self.use_segments:
+            return
+        
         while not self.stop_event.is_set():
             if not self.cleanup_paused:
                 try:
@@ -440,11 +544,23 @@ class SegmentRecorder:
         Args:
             start_time: Unix timestamp начала
             end_time: Unix timestamp конца, None = текущее время
+        
+        Returns:
+            Список путей к сегментам или прямой файл записи (для macOS)
         """
         if end_time is None:
             end_time = time.time()
         
         with self.lock:
+            # Режим прямой записи (macOS): возвращаем один файл
+            if not self.use_segments:
+                if (self.direct_output_file and 
+                    os.path.exists(self.direct_output_file) and
+                    os.path.getsize(self.direct_output_file) > 1000):
+                    return [self.direct_output_file]
+                return []
+            
+            # Режим сегментов: собираем в диапазоне
             segments = self._get_sorted_segments()
             result = []
             
@@ -487,15 +603,18 @@ class VideoMerger:
         self, 
         segments: list, 
         output_path: str,
-        crop_params: tuple = None
+        crop_params: tuple = None,
+        time_range: tuple = None
     ) -> bool:
         """
         Объединить сегменты в один файл.
         
         Args:
-            segments: Список путей к сегментам
+            segments: Список путей к сегментам (или один файл для прямой записи)
             output_path: Путь для выходного файла
             crop_params: Кортеж (x, y, width, height) для обрезки или None
+            time_range: Кортеж (start_seconds, duration_seconds) для вырезки
+                       из непрерывной записи (macOS режим)
         
         Returns:
             True если успешно
@@ -520,6 +639,58 @@ class VideoMerger:
             self.logger.warning(
                 f"Filtered segments: {len(valid_segments)}/{len(segments)} valid"
             )
+        
+        # Режим прямой записи (macOS): один файл, вырезаем нужный кусок
+        if len(valid_segments) == 1 and time_range:
+            start_sec, duration_sec = time_range
+            self.logger.info(
+                f"Direct recording mode: extracting {duration_sec:.1f}s "
+                f"starting at {start_sec:.1f}s"
+            )
+            
+            input_file = valid_segments[0]
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss", str(start_sec),  # Начало вырезки
+                "-t", str(duration_sec),  # Длительность
+                "-i", input_file,
+            ]
+            
+            if crop_params:
+                x, y, w, h = crop_params
+                self.logger.info(f"Applying crop: {w}x{h} at ({x}, {y})")
+                cmd.extend([
+                    "-vf", f"crop={w}:{h}:{x}:{y}",
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "23",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                ])
+            else:
+                cmd.extend([
+                    "-c", "copy",  # Копируем без перекодирования
+                ])
+            
+            cmd.append(output_path)
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=300
+            )
+            
+            success = result.returncode == 0 and os.path.exists(output_path)
+            
+            if not success:
+                stderr = result.stderr.decode()
+                error_lines = [l for l in stderr.split('\n') 
+                              if 'error' in l.lower()]
+                if error_lines:
+                    self.logger.error(f"FFmpeg error: {error_lines[-1][:200]}")
+            
+            return success
         
         # Создаём временный файл со списком сегментов
         list_file = output_path + ".concat.txt"
@@ -596,6 +767,37 @@ class VideoMerger:
                 pass
 
 
+def detect_gopro_macos(logger=None) -> int:
+    """
+    Автоопределение индекса GoPro на macOS через FFmpeg.
+    
+    Returns:
+        Индекс GoPro устройства или -1 если не найдено
+    """
+    import re
+    _log = logger or logging.getLogger(__name__)
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-f", "avfoundation",
+                "-list_devices", "true", "-i", ""
+            ],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stderr.split('\n'):
+            if 'gopro' in line.lower():
+                match = re.search(r'\[(\d+)\]', line)
+                if match:
+                    idx = int(match.group(1))
+                    _log.info(f"✅ Auto-detected GoPro at index {idx}")
+                    return idx
+        _log.warning("⚠️ GoPro not found in AVFoundation device list")
+        return -1
+    except Exception as e:
+        _log.warning(f"Failed to auto-detect GoPro: {e}")
+        return -1
+
+
 def get_video_duration(filepath: str) -> float:
     """Получить длительность видео через ffprobe."""
     try:
@@ -634,7 +836,17 @@ class MotionDetector:
         input_source: str = DEFAULT_INPUT_SOURCE,
         usb_device: str = DEFAULT_USB_DEVICE,
         usb_resolution: str = DEFAULT_USB_RESOLUTION,
-        usb_fps: int = DEFAULT_USB_FPS
+        usb_fps: int = DEFAULT_USB_FPS,
+        max_recording_age_days: int = DEFAULT_MAX_RECORDING_AGE_DAYS,
+        min_free_space_gb: float = DEFAULT_MIN_FREE_SPACE_GB,
+        auto_cleanup_enabled: bool = DEFAULT_AUTO_CLEANUP_ENABLED,
+        cleanup_interval_hours: int = DEFAULT_CLEANUP_INTERVAL_HOURS,
+        telegram_enabled: bool = DEFAULT_TELEGRAM_ENABLED,
+        telegram_bot_token: str = DEFAULT_TELEGRAM_BOT_TOKEN,
+        telegram_chat_id: str = DEFAULT_TELEGRAM_CHAT_ID,
+        telegram_send_on_motion: bool = DEFAULT_TELEGRAM_SEND_ON_MOTION,
+        telegram_send_manual: bool = DEFAULT_TELEGRAM_SEND_MANUAL,
+        telegram_max_video_mb: float = DEFAULT_TELEGRAM_MAX_VIDEO_MB
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -750,8 +962,62 @@ class MotionDetector:
             self.logger.info(
                 f"     Motion detection and video crop will use ROI area only"
             )
+        
+        # Storage Manager для автоматической очистки
+        self.storage_manager = None
+        if StorageManager and auto_cleanup_enabled:
+            try:
+                self.storage_manager = StorageManager(
+                    recordings_dir=self.output_dir,
+                    max_age_days=max_recording_age_days,
+                    min_free_gb=min_free_space_gb,
+                    cleanup_interval_hours=cleanup_interval_hours,
+                    logger=self.logger
+                )
+                self.logger.info(
+                    f"  🗑️ STORAGE MANAGER: cleanup every {cleanup_interval_hours}h, "
+                    f"max age {max_recording_age_days} days"
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to init StorageManager: {e}")
+        elif not auto_cleanup_enabled:
+            self.logger.info("  Storage cleanup: disabled")
+        elif not StorageManager:
+            self.logger.warning(
+                "  ⚠️ StorageManager not available (storage_manager.py not found)"
+            )
         else:
             self.logger.info(f"  ROI disabled - using full frame")
+        
+        # Telegram Bot для отправки уведомлений
+        self.telegram_notifier = None
+        self.telegram_enabled = telegram_enabled
+        self.telegram_send_on_motion = telegram_send_on_motion
+        self.telegram_send_manual = telegram_send_manual
+        
+        if telegram_enabled and TelegramNotifier:
+            if telegram_bot_token and telegram_chat_id:
+                try:
+                    self.telegram_notifier = TelegramNotifier(
+                        bot_token=telegram_bot_token,
+                        chat_id=telegram_chat_id,
+                        send_on_motion=telegram_send_on_motion,
+                        send_manual=telegram_send_manual,
+                        max_video_mb=telegram_max_video_mb,
+                        logger=self.logger
+                    )
+                    self.logger.info(
+                        f"  📱 TELEGRAM BOT: enabled for chat {telegram_chat_id}"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to init Telegram bot: {e}")
+            else:
+                self.logger.warning("Telegram enabled but token/chat_id not set")
+        elif telegram_enabled and not TelegramNotifier:
+            self.logger.warning(
+                "  ⚠️ Telegram enabled but aiogram not installed "
+                "(pip install aiogram==3.24.0)"
+            )
     
     def get_moscow_time(self) -> datetime:
         """Получить текущее время по Москве."""
@@ -771,15 +1037,63 @@ class MotionDetector:
             return self._connect_rtmp()
     
     def _connect_usb(self) -> bool:
-        """Подключение к USB веб-камере."""
-        self.logger.info(f"Connecting to USB device {self.usb_device}...")
+        """Подключение к USB веб-камере (поддерживает Linux и macOS)."""
+        system = platform.system()
+        self.logger.info(
+            f"Connecting to USB device {self.usb_device} on {system}..."
+        )
         
-        # Пробуем сначала по пути устройства
-        if self.usb_device.startswith("/dev/video"):
-            device_index = int(self.usb_device.replace("/dev/video", ""))
+        # Определяем индекс камеры в зависимости от платформы
+        if system == "Darwin":  # macOS
+            # Автоопределение GoPro
+            if self.usb_device.lower() == "auto":
+                device_index = 0
+                gopro_index = detect_gopro_macos(self.logger)
+                if gopro_index >= 0:
+                    device_index = gopro_index
+                    self.logger.info(
+                        f"🎯 Using auto-detected GoPro at index {device_index}"
+                    )
+                else:
+                    self.logger.warning(
+                        f"GoPro not found, falling back to index {device_index}"
+                    )
+            else:
+                # Конкретный индекс указан вручную
+                try:
+                    device_index = int(self.usb_device)
+                except ValueError:
+                    self.logger.warning(
+                        f"macOS: '{self.usb_device}' не число, fallback to 0"
+                    )
+                    device_index = 0
+            
             self.cap = cv2.VideoCapture(device_index)
+            self.logger.info(
+                f"macOS: Используем камеру с индексом {device_index}"
+            )
+        
+        elif system == "Linux":
+            # На Linux используем путь устройства /dev/videoX
+            if self.usb_device.startswith("/dev/video"):
+                device_index = int(self.usb_device.replace("/dev/video", ""))
+                self.cap = cv2.VideoCapture(device_index)
+            else:
+                # Попытка использовать как путь или индекс
+                try:
+                    device_index = int(self.usb_device)
+                    self.cap = cv2.VideoCapture(device_index)
+                except ValueError:
+                    self.cap = cv2.VideoCapture(self.usb_device)
+        
         else:
-            self.cap = cv2.VideoCapture(self.usb_device)
+            # Другие платформы - попытка использовать как есть
+            self.logger.warning(f"Unknown platform: {system}, trying as-is")
+            try:
+                device_index = int(self.usb_device)
+                self.cap = cv2.VideoCapture(device_index)
+            except ValueError:
+                self.cap = cv2.VideoCapture(self.usb_device)
         
         if not self.cap.isOpened():
             self.logger.error(f"Failed to open USB device {self.usb_device}")
@@ -797,8 +1111,9 @@ class MotionDetector:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, self.usb_fps)
         
-        # Устанавливаем формат MJPEG для GoPro
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # Устанавливаем формат MJPEG для GoPro (на macOS может не работать)
+        if system != "Darwin":
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         
         # Буфер минимальный для снижения задержки
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -810,7 +1125,8 @@ class MotionDetector:
         self.frame_area = self.frame_width * self.frame_height
         
         self.logger.info(
-            f"USB connected: {self.frame_width}x{self.frame_height} @ {self.fps}fps"
+            f"USB connected: {self.frame_width}x{self.frame_height} @ "
+            f"{self.fps}fps on {system}"
         )
         return True
     
@@ -878,6 +1194,17 @@ class MotionDetector:
     
     def _check_segments_fresh(self, max_age: float = 5.0) -> bool:
         """Проверить что сегменты свежие (FFmpeg работает)."""
+        # Режим прямой записи (macOS)
+        if not self.segment_recorder.use_segments:
+            if self.segment_recorder.direct_output_file:
+                if os.path.exists(self.segment_recorder.direct_output_file):
+                    age = time.time() - os.path.getmtime(
+                        self.segment_recorder.direct_output_file
+                    )
+                    return age < max_age
+            return False
+        
+        # Режим сегментов
         segments = glob.glob(
             os.path.join(self.segment_recorder.segments_dir, "seg_*.ts")
         )
@@ -997,7 +1324,23 @@ class MotionDetector:
         # Объединяем сегменты
         self.logger.info(f"Merging {len(segments)} segments...")
         
-        if self.video_merger.merge_segments(segments, temp_filepath, crop_params):
+        # Для режима прямой записи (macOS) вычисляем time_range
+        time_range = None
+        if not self.segment_recorder.use_segments and len(segments) == 1:
+            # Вычисляем смещение от начала файла записи
+            ffmpeg_start = self.segment_recorder.recording_start_time
+            if ffmpeg_start:
+                start_offset = max(0, self.recording_buffer_start_time - ffmpeg_start)
+                duration = recording_end_time - self.recording_buffer_start_time
+                time_range = (start_offset, duration)
+                self.logger.info(
+                    f"Direct mode: cutting from {start_offset:.1f}s, "
+                    f"duration {duration:.1f}s"
+                )
+        
+        if self.video_merger.merge_segments(
+            segments, temp_filepath, crop_params, time_range
+        ):
             # Проверяем что файл реально создался
             if not os.path.exists(temp_filepath):
                 self.logger.error(f"Merge reported success but file not found: {temp_filepath}")
@@ -1018,14 +1361,35 @@ class MotionDetector:
                         f"■ {type_str} saved: {final_filename} "
                         f"(duration: {real_duration:.1f}s)"
                     )
+                    
+                    # Отправить видео в Telegram (если включено)
+                    self._send_to_telegram_async(
+                        final_filepath,
+                        was_recording_type,
+                        real_duration
+                    )
                 except Exception as e:
                     self.logger.error(f"Failed to rename: {e}")
                     # Файл существует - просто используем temp имя
                     if os.path.exists(temp_filepath):
                         self.logger.info(f"■ {type_str} saved: {prefix}_{timestamp}_temp.mp4")
+                        # Отправить видео в Telegram
+                        self._send_to_telegram_async(
+                            temp_filepath,
+                            was_recording_type,
+                            real_duration
+                        )
             else:
                 self.logger.warning("Could not get duration")
+                final_filepath = temp_filepath
                 self.logger.info(f"■ {type_str} saved: {prefix}_{timestamp}_temp.mp4")
+                # Отправить видео в Telegram
+                if os.path.exists(temp_filepath):
+                    self._send_to_telegram_async(
+                        temp_filepath,
+                        was_recording_type,
+                        0.0
+                    )
         else:
             self.logger.error("Failed to merge segments")
             # Удаляем пустой temp файл если есть
@@ -1046,6 +1410,107 @@ class MotionDetector:
         
         # Возобновляем cleanup
         self.segment_recorder.resume_cleanup()
+    
+    def _send_to_telegram_async(
+        self,
+        video_path: str,
+        recording_type: RecordingType,
+        duration: float
+    ):
+        """
+        Отправить видео в Telegram асинхронно (в отдельном потоке).
+        
+        Args:
+            video_path: Путь к видео файлу
+            recording_type: Тип записи (MOTION или MANUAL)
+            duration: Длительность видео в секундах
+        """
+        # Проверяем что Telegram включен
+        if not self.telegram_notifier:
+            return
+        
+        # Проверяем настройки отправки
+        should_send = False
+        if recording_type == RecordingType.MOTION and self.telegram_send_on_motion:
+            should_send = True
+        elif recording_type == RecordingType.MANUAL and self.telegram_send_manual:
+            should_send = True
+        
+        if not should_send:
+            return
+        
+        # Формируем caption
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        duration_str = self.format_duration(duration)
+        
+        if recording_type == RecordingType.MOTION:
+            emoji = "🐦"
+            type_name = "Птица обнаружена"
+        else:
+            emoji = "🎬"
+            type_name = "Ручная запись"
+        
+        caption = (
+            f"{emoji} <b>{type_name}!</b>\n"
+            f"📅 {timestamp}\n"
+            f"⏱ Длительность: {duration_str}"
+        )
+        
+        # Запускаем отправку в отдельном потоке с НОВЫМ Bot
+        notifier = self.telegram_notifier
+        logger = self.logger
+        
+        def send_video_thread():
+            try:
+                from aiogram import Bot
+                from aiogram.types import FSInputFile
+                
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                async def _send():
+                    # Создаём НОВЫЙ Bot с тем же токеном
+                    bot = Bot(token=notifier.bot_token)
+                    try:
+                        # Проверяем размер, сжимаем если нужно
+                        final_path = video_path
+                        size_mb = os.path.getsize(video_path) / (1024**2)
+                        
+                        if size_mb > notifier.max_video_mb:
+                            logger.info(
+                                f"  📱 Compressing {size_mb:.1f}MB..."
+                            )
+                            compressed = await notifier._compress_video(video_path)
+                            if compressed and os.path.exists(compressed):
+                                final_path = compressed
+                        
+                        video_file = FSInputFile(final_path)
+                        await bot.send_video(
+                            chat_id=notifier.chat_id,
+                            video=video_file,
+                            caption=caption[:1024] if caption else None,
+                            parse_mode="HTML",
+                            supports_streaming=True
+                        )
+                        
+                        logger.info(
+                            f"  📱 Sent to Telegram: {os.path.basename(video_path)}"
+                        )
+                        
+                        # Удаляем сжатую версию
+                        if final_path != video_path and os.path.exists(final_path):
+                            os.remove(final_path)
+                        
+                    finally:
+                        await bot.session.close()
+                
+                loop.run_until_complete(_send())
+                loop.close()
+            except Exception as e:
+                logger.error(f"Error sending to Telegram: {e}", exc_info=True)
+        
+        thread = Thread(target=send_video_thread, daemon=True)
+        thread.start()
     
     def process_frame(self, frame: np.ndarray):
         """Обработка одного кадра."""
@@ -1199,6 +1664,10 @@ class MotionDetector:
         # Запускаем запись сегментов
         self.segment_recorder.start()
         
+        # Запускаем Storage Manager
+        if self.storage_manager:
+            self.storage_manager.start()
+        
         # Ждём пока накопятся сегменты для буфера
         wait_for_buffer = self.buffer_seconds + 2
         self.logger.info(f"Waiting {wait_for_buffer}s for buffer to fill...")
@@ -1252,6 +1721,8 @@ class MotionDetector:
         if self.is_recording:
             self.stop_recording()
         self.segment_recorder.stop()
+        if self.storage_manager:
+            self.storage_manager.stop()
         if self.cap:
             self.cap.release()
         self.logger.info(f"Final stats: {self.stats}")
@@ -1332,10 +1803,15 @@ def load_config(config_path: str = None) -> dict:
             config[key] = env_value
     
     if config_path is None:
+        # Приоритет: config.macos.env > config.pi.env > config.env
         possible_paths = [
-            "/app/config.env",
+            "config.macos.env",  # macOS конфиг (приоритет)
+            "config.pi.env",     # Raspberry Pi конфиг
+            "config.env",        # Общий конфиг
+            os.path.join(os.path.dirname(__file__), "..", "config.macos.env"),
+            os.path.join(os.path.dirname(__file__), "..", "config.pi.env"),
             os.path.join(os.path.dirname(__file__), "..", "config.env"),
-            "config.env",
+            "/app/config.env",
         ]
         for path in possible_paths:
             if os.path.exists(path):
@@ -1350,6 +1826,32 @@ def load_config(config_path: str = None) -> dict:
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
                     config[key.strip()] = value.strip()
+    
+    # Загружаем credentials.env (секреты отдельно от конфига)
+    creds_paths = [
+        "credentials.env",
+        os.path.join(os.path.dirname(__file__), "..", "credentials.env"),
+    ]
+    for creds_path in creds_paths:
+        if os.path.exists(creds_path):
+            print(f"🔐 Loading credentials from: {creds_path}")
+            with open(creds_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        # Credentials перезаписывают пустые значения
+                        if value and (not config.get(key) or config.get(key) == ""):
+                            config[key] = value
+            break
+    
+    # Переменные окружения имеют наивысший приоритет
+    for key in list(config.keys()):
+        env_value = os.environ.get(key)
+        if env_value is not None and env_value != "":
+            config[key] = env_value
     
     return config
 
@@ -1385,6 +1887,24 @@ def main():
     usb_resolution = config.get("USB_RESOLUTION", "1080")
     usb_fps = int(config.get("USB_FPS", "30"))
     
+    # Storage Manager параметры
+    max_recording_age_days = int(config.get("MAX_RECORDING_AGE_DAYS", "30"))
+    min_free_space_gb = float(config.get("MIN_FREE_SPACE_GB", "10.0"))
+    auto_cleanup_enabled = config.get("AUTO_CLEANUP_ENABLED", "true").lower() == "true"
+    cleanup_interval_hours = int(config.get("CLEANUP_INTERVAL_HOURS", "1"))
+    
+    # Telegram параметры
+    telegram_enabled = config.get("TELEGRAM_ENABLED", "false").lower() == "true"
+    telegram_bot_token = config.get("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id = config.get("TELEGRAM_CHAT_ID", "")
+    telegram_send_on_motion = config.get(
+        "TELEGRAM_SEND_ON_MOTION", "true"
+    ).lower() == "true"
+    telegram_send_manual = config.get(
+        "TELEGRAM_SEND_MANUAL", "false"
+    ).lower() == "true"
+    telegram_max_video_mb = float(config.get("TELEGRAM_MAX_VIDEO_MB", "45.0"))
+    
     detector = MotionDetector(
         rtmp_url=rtmp_url,
         output_dir=output_dir,
@@ -1405,7 +1925,17 @@ def main():
         input_source=input_source,
         usb_device=usb_device,
         usb_resolution=usb_resolution,
-        usb_fps=usb_fps
+        usb_fps=usb_fps,
+        max_recording_age_days=max_recording_age_days,
+        min_free_space_gb=min_free_space_gb,
+        auto_cleanup_enabled=auto_cleanup_enabled,
+        cleanup_interval_hours=cleanup_interval_hours,
+        telegram_enabled=telegram_enabled,
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
+        telegram_send_on_motion=telegram_send_on_motion,
+        telegram_send_manual=telegram_send_manual,
+        telegram_max_video_mb=telegram_max_video_mb
     )
     
     def signal_handler(sig, frame):
@@ -1419,6 +1949,20 @@ def main():
         target=monitor_control_file, args=(detector, control_file), daemon=True
     )
     control_thread.start()
+    
+    # Запускаем Telegram bot polling в отдельном потоке (если включен)
+    if detector.telegram_notifier:
+        def run_telegram_polling():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(detector.telegram_notifier.start_polling())
+            except Exception as e:
+                detector.logger.error(f"Telegram polling error: {e}")
+        
+        telegram_thread = Thread(target=run_telegram_polling, daemon=True)
+        telegram_thread.start()
+        detector.logger.info("Telegram bot polling started in background")
     
     if auto_start_motion:
         detector.enable_motion_detection()
