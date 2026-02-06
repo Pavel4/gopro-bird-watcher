@@ -174,13 +174,25 @@ gopro-bird-watcher/
 - [Raspberry Pi: развертывание](docs/RASPBERRY_PI.md)
 - [Telegram бот: настройка](docs/TELEGRAM_BOT.md)
 - [Backlog: проблемы и планы](docs/BACKLOG.md)
+- [Настройка ROI (область детекции)](docs/ROI_SETUP.md)
 
 ## Настройка ROI (Region of Interest)
 
-ROI позволяет записывать только область кормушки:
+ROI позволяет детектировать движение и записывать
+только в области кормушки. Подробная инструкция:
+[docs/ROI_SETUP.md](docs/ROI_SETUP.md)
+
+Быстрый старт (интерактивный выбор мышкой):
 
 ```bash
+# Нативный режим — USB auto (GoPro)
 ./scripts/select-roi.sh
+
+# Или с указанием индекса камеры
+./scripts/select-roi.sh --usb 0
+
+# Из готового изображения
+./scripts/select-roi.sh --image frame.jpg
 ```
 
 Или вручную в конфиге:

@@ -112,6 +112,95 @@ def setup_logging(log_file: str = None):
     return logging.getLogger(__name__)
 
 
+class FileCapture:
+    """
+    Читает кадры из растущего .ts файла, который
+    FFmpeg пишет в реальном времени.
+    На macOS: вместо второго доступа к камере,
+    OpenCV читает тот же файл что записывает FFmpeg.
+    Периодически переоткрывает файл чтобы видеть
+    новые данные.
+    """
+
+    def __init__(self, ts_path, width, height, fps,
+                 logger=None):
+        self._log = logger or logging.getLogger(__name__)
+        self.ts_path = ts_path
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._cap = None
+        self._eof_count = 0
+        self._max_eof = 5  # переоткрыть после 5 EOF
+        self._opened = True
+        # Подавляем h264 warnings от FFmpeg при чтении
+        # растущего .ts файла (corrupted macroblock и т.п.)
+        # Наши логи идут через stdout — не затронуты.
+        self._suppress_ffmpeg_warnings()
+        self._reopen()
+
+    @staticmethod
+    def _suppress_ffmpeg_warnings():
+        """Перенаправить C-level stderr в /dev/null."""
+        try:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull_fd, 2)  # fd 2 = stderr
+            os.close(devnull_fd)
+        except Exception:
+            pass
+
+    def _reopen(self):
+        """Переоткрыть файл и перемотать к концу."""
+        if self._cap:
+            self._cap.release()
+        self._cap = cv2.VideoCapture(self.ts_path)
+        if self._cap.isOpened():
+            total = int(
+                self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            )
+            # Перемотать к последним кадрам
+            if total > 10:
+                self._cap.set(
+                    cv2.CAP_PROP_POS_FRAMES, total - 5
+                )
+            self._eof_count = 0
+
+    def isOpened(self):
+        return self._opened and os.path.exists(self.ts_path)
+
+    def read(self):
+        if not self._opened or not self._cap:
+            return False, None
+        ret, frame = self._cap.read()
+        if ret:
+            self._eof_count = 0
+            return True, frame
+        # EOF — файл ещё пишется, подождать
+        self._eof_count += 1
+        if self._eof_count >= self._max_eof:
+            self._reopen()
+        else:
+            time.sleep(0.033)  # ~30fps
+        return False, None
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self.width)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self.height)
+        if prop == cv2.CAP_PROP_FPS:
+            return float(self.fps)
+        return 0.0
+
+    def set(self, prop, value):
+        pass
+
+    def release(self):
+        if self._cap:
+            self._cap.release()
+        self._opened = False
+
+
 class SegmentRecorder:
     """
     Записывает видеопоток короткими сегментами через FFmpeg.
@@ -161,7 +250,7 @@ class SegmentRecorder:
         # Для режима без сегментов (macOS USB)
         self.direct_output_file = None
         self.recording_start_time = None
-        
+
         # Очищаем и создаём папку сегментов
         self._clean_segments_dir()
         
@@ -267,22 +356,30 @@ class SegmentRecorder:
                     "ffmpeg",
                     "-y",
                     "-loglevel", "warning",
-                    # Входные параметры для AVFoundation (macOS)
                     "-f", "avfoundation",
                     "-framerate", str(self.usb_fps),
                     "-video_size", resolution,
-                    "-i", ffmpeg_device,  # Автоопределённый индекс GoPro
-                    # Кодирование (без сегментации)
+                    "-i", ffmpeg_device,
                     "-c:v", "libx264",
                     "-preset", "ultrafast",
                     "-tune", "zerolatency",
+                    "-g", "30",
                     "-crf", "23",
-                    "-f", "mpegts",  # MPEG-TS формат
+                    "-f", "mpegts",
                     self.direct_output_file
                 ]
-                self.logger.info(f"  Direct recording to: {self.direct_output_file}")
+                self.logger.info(
+                    f"  Recording: {self.direct_output_file}"
+                )
+                self.logger.info(
+                    "  Keyframe interval: 1s (-g 30)"
+                )
+                self.logger.info(
+                    "  Analysis: from .ts file (shared)"
+                )
                 self.logger.warning(
-                    "  ⚠️  macOS mode: NO pre-buffer (recording starts from now)"
+                    "  macOS: NO pre-buffer "
+                    "(recording starts from now)"
                 )
             else:  # Linux - используем V4L2
                 cmd = [
@@ -649,29 +746,32 @@ class VideoMerger:
             )
             
             input_file = valid_segments[0]
+            # -ss ПОСЛЕ -i = output seeking (точный,
+            # но медленнее). Перекодируем для чистого
+            # начала видео (без чёрных/битых кадров).
             cmd = [
                 "ffmpeg",
                 "-y",
-                "-ss", str(start_sec),  # Начало вырезки
-                "-t", str(duration_sec),  # Длительность
                 "-i", input_file,
+                "-ss", str(start_sec),
+                "-t", str(duration_sec),
             ]
             
             if crop_params:
                 x, y, w, h = crop_params
-                self.logger.info(f"Applying crop: {w}x{h} at ({x}, {y})")
+                self.logger.info(
+                    f"Applying crop: {w}x{h} at ({x}, {y})"
+                )
                 cmd.extend([
                     "-vf", f"crop={w}:{h}:{x}:{y}",
-                    "-c:v", "libx264",
-                    "-preset", "fast",
-                    "-crf", "23",
-                    "-c:a", "aac",
-                    "-b:a", "128k",
                 ])
-            else:
-                cmd.extend([
-                    "-c", "copy",  # Копируем без перекодирования
-                ])
+
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-an",  # Без аудио (USB-камера)
+            ])
             
             cmd.append(output_path)
             
@@ -775,7 +875,13 @@ def detect_gopro_macos(logger=None) -> int:
         Индекс GoPro устройства или -1 если не найдено
     """
     import re
-    _log = logger or logging.getLogger(__name__)
+
+    def _print(msg):
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
     try:
         result = subprocess.run(
             [
@@ -784,17 +890,42 @@ def detect_gopro_macos(logger=None) -> int:
             ],
             capture_output=True, text=True, timeout=5
         )
+        # Выводим полный список устройств для отладки
+        devices = []
+        for line in result.stderr.split('\n'):
+            if 'AVFoundation' in line and ']' in line:
+                match = re.search(
+                    r'\[(\d+)\]\s*(.*)', line
+                )
+                if match:
+                    devices.append(
+                        (int(match.group(1)), match.group(2))
+                    )
+        if devices:
+            _print("AVFoundation устройства:")
+            for idx, name in devices:
+                marker = " <-- GoPro" if (
+                    'gopro' in name.lower()
+                ) else ""
+                _print(f"  [{idx}] {name}{marker}")
+
         for line in result.stderr.split('\n'):
             if 'gopro' in line.lower():
                 match = re.search(r'\[(\d+)\]', line)
                 if match:
                     idx = int(match.group(1))
-                    _log.info(f"✅ Auto-detected GoPro at index {idx}")
+                    _print(
+                        f"GoPro найдена: AVFoundation"
+                        f" index {idx}"
+                    )
                     return idx
-        _log.warning("⚠️ GoPro not found in AVFoundation device list")
+        _print(
+            "GoPro не найдена в списке "
+            "AVFoundation устройств"
+        )
         return -1
     except Exception as e:
-        _log.warning(f"Failed to auto-detect GoPro: {e}")
+        _print(f"Ошибка автоопределения GoPro: {e}")
         return -1
 
 
@@ -1045,34 +1176,51 @@ class MotionDetector:
         
         # Определяем индекс камеры в зависимости от платформы
         if system == "Darwin":  # macOS
-            # Автоопределение GoPro
-            if self.usb_device.lower() == "auto":
-                device_index = 0
-                gopro_index = detect_gopro_macos(self.logger)
-                if gopro_index >= 0:
-                    device_index = gopro_index
-                    self.logger.info(
-                        f"🎯 Using auto-detected GoPro at index {device_index}"
-                    )
-                else:
-                    self.logger.warning(
-                        f"GoPro not found, falling back to index {device_index}"
-                    )
-            else:
-                # Конкретный индекс указан вручную
-                try:
-                    device_index = int(self.usb_device)
-                except ValueError:
-                    self.logger.warning(
-                        f"macOS: '{self.usb_device}' не число, fallback to 0"
-                    )
-                    device_index = 0
-            
-            self.cap = cv2.VideoCapture(device_index)
-            self.logger.info(
-                f"macOS: Используем камеру с индексом {device_index}"
+            # На macOS OpenCV и FFmpeg нумеруют камеры
+            # по-разному. Вместо открытия камеры через
+            # cv2.VideoCapture (активирует вебку MacBook),
+            # читаем кадры из .ts файла, который FFmpeg
+            # уже пишет с GoPro. Один процесс — один файл.
+            ts_file = self.segment_recorder.direct_output_file
+            if not ts_file or not os.path.exists(ts_file):
+                self.logger.error(
+                    f"macOS: recording file not found: "
+                    f"{ts_file}"
+                )
+                return False
+
+            resolution_map = {
+                "480": (854, 480),
+                "720": (1280, 720),
+                "1080": (1920, 1080)
+            }
+            w, h = resolution_map.get(
+                self.usb_resolution, (1280, 720)
             )
-        
+
+            self.cap = FileCapture(
+                ts_file, w, h,
+                self.usb_fps, self.logger
+            )
+
+            if not self.cap.isOpened():
+                self.logger.error(
+                    f"Cannot open recording file: "
+                    f"{ts_file}"
+                )
+                return False
+
+            self.fps = self.usb_fps
+            self.frame_width = w
+            self.frame_height = h
+            self.frame_area = w * h
+
+            self.logger.info(
+                f"macOS: analysis from .ts file, "
+                f"{w}x{h} @ {self.fps}fps"
+            )
+            return True
+
         elif system == "Linux":
             # На Linux используем путь устройства /dev/videoX
             if self.usb_device.startswith("/dev/video"):
@@ -1690,17 +1838,27 @@ class MotionDetector:
         reconnect_attempts = 0
         max_reconnect_attempts = 10
         
+        is_file_capture = isinstance(self.cap, FileCapture)
+
         while not self.stop_event.is_set():
             ret, frame = self.cap.read()
             
             if not ret:
+                if is_file_capture:
+                    # FileCapture: EOF — файл ещё пишется,
+                    # read() сам обрабатывает переоткрытие
+                    continue
+
                 reconnect_attempts += 1
                 self.logger.warning(
-                    f"Frame read failed. Reconnect attempt {reconnect_attempts}"
+                    f"Frame read failed. "
+                    f"Reconnect attempt {reconnect_attempts}"
                 )
                 
                 if reconnect_attempts > max_reconnect_attempts:
-                    self.logger.error("Max reconnect attempts reached. Exiting.")
+                    self.logger.error(
+                        "Max reconnect attempts reached."
+                    )
                     break
                 
                 time.sleep(2)
@@ -1886,6 +2044,28 @@ def main():
     usb_device = config.get("USB_DEVICE", "/dev/video0")
     usb_resolution = config.get("USB_RESOLUTION", "1080")
     usb_fps = int(config.get("USB_FPS", "30"))
+
+    # Автоопределение GoPro ОДИН РАЗ (для обоих: FFmpeg и OpenCV)
+    # ВАЖНО: используем print(), а не logging.*,
+    # чтобы не сломать logging.basicConfig() в setup_logging()
+    if (
+        input_source == "usb"
+        and isinstance(usb_device, str)
+        and usb_device.lower() == "auto"
+        and platform.system() == "Darwin"
+    ):
+        detected_index = detect_gopro_macos()
+        if detected_index >= 0:
+            usb_device = str(detected_index)
+            print(
+                f"GoPro auto-detected at index "
+                f"{detected_index}, using for all"
+            )
+        else:
+            usb_device = "0"
+            print(
+                "GoPro not found, fallback to index 0"
+            )
     
     # Storage Manager параметры
     max_recording_age_days = int(config.get("MAX_RECORDING_AGE_DAYS", "30"))

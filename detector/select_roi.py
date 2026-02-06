@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
 Интерактивный инструмент для выбора области интереса (ROI).
-Позволяет захватить кадр с RTMP потока и выбрать область кормушки мышкой.
+Позволяет захватить кадр с камеры и выбрать область кормушки мышкой.
 
 Использование:
-    python select_roi.py [--rtmp URL] [--image PATH] [--config PATH]
+    python select_roi.py --usb auto               # USB (автоопределение)
+    python select_roi.py --usb 0                   # USB по индексу
+    python select_roi.py --image frame.jpg         # Из изображения
+    python select_roi.py --rtmp rtmp://host/live   # С RTMP потока
 
 Примеры:
-    python select_roi.py                           # Захват с RTMP по умолчанию
-    python select_roi.py --image frame.jpg         # Использовать изображение
-    python select_roi.py --rtmp rtmp://host/live   # Указать RTMP URL
+    python select_roi.py --usb auto                # GoPro по USB
+    python select_roi.py --usb auto --save-frame frame.jpg
+    python select_roi.py --image frame.jpg         # Готовое изображение
+    python select_roi.py --rtmp rtmp://host/live   # RTMP поток
 """
 
 import cv2
 import numpy as np
 import argparse
 import os
+import platform
+import re
+import subprocess
 import sys
 import time
 
@@ -117,6 +124,101 @@ def load_frame_from_file(image_path: str) -> np.ndarray:
     
     h, w = frame.shape[:2]
     print(f"✅ Изображение загружено: {w}x{h}")
+    return frame
+
+
+def detect_gopro_index() -> int:
+    """
+    Автоопределение индекса GoPro на macOS через FFmpeg.
+
+    Returns:
+        Индекс GoPro устройства или -1 если не найдено
+    """
+    if platform.system() != "Darwin":
+        print("⚠️  Автоопределение GoPro поддерживается только на macOS")
+        return -1
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-f", "avfoundation",
+                "-list_devices", "true", "-i", ""
+            ],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stderr.split('\n'):
+            if 'gopro' in line.lower():
+                match = re.search(r'\[(\d+)\]', line)
+                if match:
+                    idx = int(match.group(1))
+                    print(f"✅ GoPro найдена: индекс {idx}")
+                    return idx
+        print("⚠️  GoPro не найдена в списке устройств")
+        return -1
+    except Exception as e:
+        print(f"❌ Ошибка автоопределения GoPro: {e}")
+        return -1
+
+
+def capture_frame_from_usb(
+    device_index, timeout: int = 10
+) -> np.ndarray:
+    """
+    Захватить один кадр с USB-камеры (OpenCV VideoCapture).
+
+    Args:
+        device_index: Индекс камеры (int) или 'auto'
+        timeout: Таймаут ожидания в секундах
+
+    Returns:
+        Кадр как numpy array или None при ошибке
+    """
+    # Определяем индекс устройства
+    if isinstance(device_index, str) and device_index.lower() == "auto":
+        idx = detect_gopro_index()
+        if idx < 0:
+            print("⚠️  GoPro не найдена, пробуем камеру 0...")
+            idx = 0
+    else:
+        try:
+            idx = int(device_index)
+        except ValueError:
+            print(f"❌ Неверный индекс камеры: {device_index}")
+            return None
+
+    print(f"📹 Подключение к USB камере (индекс {idx})...")
+
+    cap = cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        print(f"❌ Не удалось открыть камеру {idx}")
+        return None
+
+    # Пробуем захватить несколько кадров (первые могут быть битые)
+    start_time = time.time()
+    frame = None
+
+    for attempt in range(100):
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            if np.mean(frame) > 10:
+                break
+
+        if time.time() - start_time > timeout:
+            print(
+                f"❌ Таймаут {timeout}с — не удалось получить кадр"
+            )
+            cap.release()
+            return None
+
+        time.sleep(0.1)
+
+    cap.release()
+
+    if frame is None:
+        print("❌ Не удалось захватить кадр с USB камеры")
+        return None
+
+    h, w = frame.shape[:2]
+    print(f"✅ Кадр захвачен с USB камеры: {w}x{h}")
     return frame
 
 
@@ -336,21 +438,32 @@ def save_frame(frame: np.ndarray, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Интерактивный выбор области интереса (ROI) для кормушки'
+        description=(
+            'Интерактивный выбор области интереса '
+            '(ROI) для кормушки'
+        )
+    )
+    parser.add_argument(
+        '--usb', '-u',
+        nargs='?', const='auto', default=None,
+        help=(
+            'USB камера: индекс (0,1,...) или "auto" '
+            'для автоопределения GoPro (по умолчанию: auto)'
+        )
     )
     parser.add_argument(
         '--rtmp', '-r',
-        default='rtmp://nginx-rtmp/live',
-        help='URL RTMP потока (по умолчанию: rtmp://nginx-rtmp/live)'
+        default=None,
+        help='URL RTMP потока'
     )
     parser.add_argument(
         '--image', '-i',
-        help='Путь к изображению (вместо захвата с RTMP)'
+        help='Путь к изображению (вместо камеры)'
     )
     parser.add_argument(
         '--config', '-c',
-        default='/app/config.env',
-        help='Путь к config.env (по умолчанию: /app/config.env)'
+        default=None,
+        help='Путь к config.env (автоопределение по платформе)'
     )
     parser.add_argument(
         '--save-frame', '-s',
@@ -359,24 +472,50 @@ def main():
     parser.add_argument(
         '--no-save',
         action='store_true',
-        help='Не сохранять в config.env (только показать координаты)'
+        help=(
+            'Не сохранять в config.env '
+            '(только показать координаты)'
+        )
     )
-    
+
     args = parser.parse_args()
-    
+
+    # Автоопределение пути к конфигу
+    if args.config is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_dir = os.path.dirname(script_dir)
+        system = platform.system()
+        if system == "Darwin":
+            cfg = os.path.join(project_dir, "config.macos.env")
+        elif os.path.exists("/proc/device-tree/model"):
+            cfg = os.path.join(project_dir, "config.pi.env")
+        else:
+            cfg = os.path.join(project_dir, "config.env")
+        args.config = cfg
+
     print("=" * 60)
-    print("🎯 Инструмент выбора ROI (Region of Interest)")
+    print("  Инструмент выбора ROI (Region of Interest)")
     print("=" * 60)
-    
-    # Получаем кадр
+
+    # Получаем кадр (приоритет: image > usb > rtmp)
+    frame = None
     if args.image:
         frame = load_frame_from_file(args.image)
-    else:
+    elif args.usb is not None:
+        frame = capture_frame_from_usb(args.usb)
+    elif args.rtmp:
         frame = capture_frame_from_rtmp(args.rtmp)
-    
+    else:
+        # По умолчанию — USB auto
+        print("Источник не указан, пробуем USB (auto)...")
+        frame = capture_frame_from_usb("auto")
+
     if frame is None:
-        print("\n💡 Совет: Убедитесь что GoPro стримит на RTMP сервер")
-        print("   Или используйте --image для загрузки существующего изображения")
+        print("\n  Совет:")
+        print("   --usb auto    : GoPro по USB")
+        print("   --usb 0       : камера по индексу")
+        print("   --image FILE  : готовое изображение")
+        print("   --rtmp URL    : RTMP поток")
         sys.exit(1)
     
     # Сохраняем кадр если нужно
@@ -406,12 +545,25 @@ def main():
     # Сохраняем в конфиг
     if not args.no_save:
         if update_config_file(args.config, roi):
-            print("\n✅ ROI настроен! Перезапустите детектор для применения.")
-            print("   Команда: docker-compose restart detector")
+            print(
+                f"\n✅ ROI настроен в {args.config}! "
+                "Перезапустите детектор."
+            )
+            print("   Native:  ./run-native.sh")
+            print(
+                "   Docker:  "
+                "docker-compose restart detector"
+            )
         else:
-            print("\n⚠️  Не удалось сохранить в конфиг. Добавьте параметры вручную.")
+            print(
+                "\n⚠️  Не удалось сохранить. "
+                "Добавьте параметры вручную."
+            )
     else:
-        print("\n📝 Добавьте эти параметры в config.env вручную")
+        print(
+            "\n  Добавьте эти параметры "
+            "в config.env вручную"
+        )
     
     print()
 
