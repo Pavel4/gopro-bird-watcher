@@ -10,58 +10,60 @@ services:
       - ./recordings:/recordings
     restart: unless-stopped
 
-  motion-detector:
+  # Единый контейнер для детектора движения и разработки
+  # Запуск: docker-compose up -d
+  # Подключение: docker exec -it gopro-detector bash
+  # Внутри можно запускать: python detector/motion_detector.py
+  detector:
     build: ./detector
-    container_name: gopro-motion-detector
-    volumes:
-      - ./recordings:/recordings
-      - ./logs:/logs
-      - ./control:/tmp/control
-    environment:
-      - RTMP_URL=rtmp://nginx-rtmp/live
-      - OUTPUT_DIR=/recordings
-      - LOG_FILE=/logs/motion_detector.log
-      - TZ=Europe/Moscow
-      # Буфер записи
-      - BUFFER_SECONDS=3
-      - POST_MOTION_SECONDS=3
-      # Пороги для значимого движения
-      - MIN_CONTOUR_AREA=500        # Мин. площадь одного контура (пиксели)
-      - MIN_MOTION_FRAMES=3         # Мин. кадров подряд для срабатывания
-      - MOTION_AREA_PERCENT=2.5     # Мин. % площади кадра с движением
-      # Управление
-      - AUTO_START_RECORDING=false
-      - CONTROL_FILE=/tmp/control/command
-    depends_on:
-      - nginx-rtmp
-    restart: unless-stopped
-
-  # Dev-контейнер для разработки и анализа
-  # Запуск: docker-compose --profile dev run --rm dev bash
-  dev:
-    build: ./detector
-    container_name: gopro-dev
+    container_name: gopro-detector
+    # Привилегированный режим для доступа к USB устройствам
+    privileged: true
     volumes:
       - .:/app
+      # Проброс USB устройств для режима webcam
+      - /dev:/dev
+    devices:
+      # Основное USB устройство (GoPro в режиме webcam)
+      - /dev/video0:/dev/video0
+      # Дополнительные устройства (на случай если GoPro на другом номере)
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
     environment:
-      - RTMP_URL=rtmp://nginx-rtmp/live
+      - TZ=Europe/Moscow
       - OUTPUT_DIR=/app/recordings
       - LOG_FILE=/app/logs/motion_detector.log
-      - TZ=Europe/Moscow
+      - CONTROL_FILE=/app/control/command
+      # Источник видео: "usb" или "rtmp"
+      - INPUT_SOURCE=${INPUT_SOURCE:-usb}
+      # USB режим (GoPro подключён по кабелю)
+      - USB_DEVICE=${USB_DEVICE:-/dev/video0}
+      - USB_RESOLUTION=${USB_RESOLUTION:-1080}
+      - USB_FPS=${USB_FPS:-30}
+      # RTMP режим (WiFi стриминг) - если INPUT_SOURCE=rtmp
+      - RTMP_URL=rtmp://nginx-rtmp/live
+      # Общие настройки детекции
       - BUFFER_SECONDS=5
       - POST_MOTION_SECONDS=5
       - MIN_CONTOUR_AREA=500
       - MIN_MOTION_FRAMES=3
       - MOTION_AREA_PERCENT=0.5
-      - CONTROL_FILE=/app/control/command
+      # ROI (Region of Interest) - область кормушки
+      - ROI_ENABLED=${ROI_ENABLED:-false}
+      - ROI_X=${ROI_X:-0}
+      - ROI_Y=${ROI_Y:-0}
+      - ROI_WIDTH=${ROI_WIDTH:-0}
+      - ROI_HEIGHT=${ROI_HEIGHT:-0}
+      # X11 для интерактивного выбора ROI (опционально)
+      - DISPLAY=${DISPLAY:-:0}
     working_dir: /app
     stdin_open: true
     tty: true
-    profiles:
-      - dev
-    depends_on:
-      - nginx-rtmp
-    command: bash
+    # depends_on закомментирован - nginx-rtmp не нужен для USB режима
+    # depends_on:
+    #   - nginx-rtmp
+    command: sleep infinity
+    restart: unless-stopped
 
   # Опционально: веб-плеер для просмотра в браузере
   # web-player:

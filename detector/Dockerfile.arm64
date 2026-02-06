@@ -1,0 +1,29 @@
+FROM arm64v8/python:3.11-slim
+
+# Установка зависимостей для OpenCV + FFmpeg + инструменты разработки
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    ffmpeg \
+    git \
+    vim \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Копируем и устанавливаем Python зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем код приложения
+COPY motion_detector.py storage_manager.py telegram_bot.py ./
+
+# Переменные окружения по умолчанию
+ENV PLATFORM=linux
+ENV ARM_OPTIMIZED=true
+
+CMD ["python", "-u", "motion_detector.py"]
