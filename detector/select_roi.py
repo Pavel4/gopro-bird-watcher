@@ -163,7 +163,11 @@ def capture_frame_from_usb(
     device_index, timeout: int = 10
 ) -> np.ndarray:
     """
-    Захватить один кадр с USB-камеры (OpenCV VideoCapture).
+    Захватить один кадр с USB-камеры.
+
+    На macOS: через FFmpeg (AVFoundation), т.к. OpenCV
+    и FFmpeg используют разные индексы устройств.
+    На Linux: через OpenCV VideoCapture.
 
     Args:
         device_index: Индекс камеры (int) или 'auto'
@@ -173,7 +177,8 @@ def capture_frame_from_usb(
         Кадр как numpy array или None при ошибке
     """
     # Определяем индекс устройства
-    if isinstance(device_index, str) and device_index.lower() == "auto":
+    if (isinstance(device_index, str)
+            and device_index.lower() == "auto"):
         idx = detect_gopro_index()
         if idx < 0:
             print("⚠️  GoPro не найдена, пробуем камеру 0...")
@@ -182,17 +187,110 @@ def capture_frame_from_usb(
         try:
             idx = int(device_index)
         except ValueError:
-            print(f"❌ Неверный индекс камеры: {device_index}")
+            print(
+                f"❌ Неверный индекс камеры: "
+                f"{device_index}"
+            )
             return None
 
-    print(f"📹 Подключение к USB камере (индекс {idx})...")
+    print(
+        f"📹 Подключение к USB камере "
+        f"(индекс {idx})..."
+    )
 
+    # macOS: захват через FFmpeg (AVFoundation)
+    # Индексы FFmpeg и OpenCV не совпадают на macOS!
+    if platform.system() == "Darwin":
+        return _capture_frame_ffmpeg_macos(idx, timeout)
+
+    # Linux: стандартный OpenCV
+    return _capture_frame_opencv(idx, timeout)
+
+
+def _capture_frame_ffmpeg_macos(
+    idx: int, timeout: int = 10
+) -> np.ndarray:
+    """
+    Захватить один кадр через FFmpeg AVFoundation.
+    Решает проблему несовпадения индексов камер
+    между FFmpeg и OpenCV на macOS.
+    """
+    import tempfile
+    tmp_path = os.path.join(
+        tempfile.gettempdir(),
+        "select_roi_frame.jpg"
+    )
+    # Удаляем старый файл если есть
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loglevel", "error",
+        "-f", "avfoundation",
+        "-pixel_format", "uyvy422",
+        "-framerate", "30",
+        "-video_size", "1920x1080",
+        "-i", str(idx),
+        "-frames:v", "5",
+        "-update", "1",
+        "-q:v", "2",
+        tmp_path,
+    ]
+
+    print(
+        f"   macOS: захват через FFmpeg "
+        f"(AVFoundation, device {idx})..."
+    )
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+        if result.returncode != 0:
+            print(
+                f"❌ FFmpeg ошибка: "
+                f"{result.stderr[:300]}"
+            )
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"❌ Таймаут {timeout}с — FFmpeg не ответил")
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка запуска FFmpeg: {e}")
+        return None
+
+    if not os.path.exists(tmp_path):
+        print("❌ FFmpeg не создал файл кадра")
+        return None
+
+    frame = cv2.imread(tmp_path)
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    if frame is None:
+        print("❌ Не удалось прочитать захваченный кадр")
+        return None
+
+    h, w = frame.shape[:2]
+    print(f"✅ Кадр захвачен с USB камеры: {w}x{h}")
+    return frame
+
+
+def _capture_frame_opencv(
+    idx: int, timeout: int = 10
+) -> np.ndarray:
+    """Захватить кадр через OpenCV (Linux)."""
     cap = cv2.VideoCapture(idx)
     if not cap.isOpened():
         print(f"❌ Не удалось открыть камеру {idx}")
         return None
 
-    # Пробуем захватить несколько кадров (первые могут быть битые)
     start_time = time.time()
     frame = None
 
@@ -204,7 +302,8 @@ def capture_frame_from_usb(
 
         if time.time() - start_time > timeout:
             print(
-                f"❌ Таймаут {timeout}с — не удалось получить кадр"
+                f"❌ Таймаут {timeout}с — "
+                f"не удалось получить кадр"
             )
             cap.release()
             return None
@@ -363,13 +462,18 @@ def show_roi_preview(frame: np.ndarray, roi: tuple):
     cv2.destroyAllWindows()
 
 
-def update_config_file(config_path: str, roi: tuple) -> bool:
+def update_config_file(
+    config_path: str,
+    roi: tuple,
+    enable_crop: bool = False
+) -> bool:
     """
-    Обновить файл конфигурации с новыми ROI параметрами.
+    Обновить файл конфигурации с ROI и CROP.
     
     Args:
         config_path: Путь к config.env
         roi: Кортеж (x, y, width, height)
+        enable_crop: Также включить CROP_VIDEO
     
     Returns:
         True если успешно
@@ -383,50 +487,72 @@ def update_config_file(config_path: str, roi: tuple) -> bool:
             lines = f.readlines()
     
     # Параметры для обновления
-    roi_params = {
+    params = {
         'ROI_ENABLED': 'true',
         'ROI_X': str(x),
         'ROI_Y': str(y),
         'ROI_WIDTH': str(w),
-        'ROI_HEIGHT': str(h)
+        'ROI_HEIGHT': str(h),
     }
     
-    # Обновляем существующие или помечаем для добавления
+    # Если включаем CROP — ставим те же координаты
+    # (fallback: CROP=0 → используются ROI)
+    if enable_crop:
+        params['CROP_VIDEO_ENABLED'] = 'true'
+    
+    # Обновляем существующие параметры
     updated_keys = set()
     new_lines = []
     
     for line in lines:
         stripped = line.strip()
-        if stripped and not stripped.startswith('#') and '=' in stripped:
+        if (stripped
+                and not stripped.startswith('#')
+                and '=' in stripped):
             key = stripped.split('=', 1)[0].strip()
-            if key in roi_params:
-                new_lines.append(f"{key}={roi_params[key]}\n")
+            if key in params:
+                new_lines.append(
+                    f"{key}={params[key]}\n"
+                )
                 updated_keys.add(key)
                 continue
         new_lines.append(line)
     
     # Добавляем недостающие параметры
-    missing_keys = set(roi_params.keys()) - updated_keys
-    if missing_keys:
-        # Проверяем есть ли уже секция ROI
-        has_roi_section = any('ROI' in line and '===' in line for line in new_lines)
+    missing = set(params.keys()) - updated_keys
+    if missing:
+        has_roi = any(
+            'ROI' in l and '===' in l
+            for l in new_lines
+        )
+        if not has_roi:
+            new_lines.append(
+                "\n# === ROI — выбрано через "
+                "select_roi.py ===\n"
+            )
         
-        if not has_roi_section:
-            new_lines.append("\n# === ROI (Region of Interest) - область кормушки ===\n")
-            new_lines.append("# Координаты выбраны через select_roi.py\n")
-        
-        for key in ['ROI_ENABLED', 'ROI_X', 'ROI_Y', 'ROI_WIDTH', 'ROI_HEIGHT']:
-            if key in missing_keys:
-                new_lines.append(f"{key}={roi_params[key]}\n")
+        ordered = [
+            'ROI_ENABLED', 'ROI_X', 'ROI_Y',
+            'ROI_WIDTH', 'ROI_HEIGHT',
+            'CROP_VIDEO_ENABLED',
+        ]
+        for key in ordered:
+            if key in missing:
+                new_lines.append(
+                    f"{key}={params[key]}\n"
+                )
     
     # Записываем
     try:
         with open(config_path, 'w') as f:
             f.writelines(new_lines)
-        print(f"✅ Конфигурация сохранена в {config_path}")
+        print(
+            f"✅ Конфигурация сохранена "
+            f"в {config_path}"
+        )
         return True
     except Exception as e:
-        print(f"❌ Ошибка записи конфигурации: {e}")
+        print(f"❌ Ошибка записи: {e}")
         return False
 
 
@@ -475,6 +601,14 @@ def main():
         help=(
             'Не сохранять в config.env '
             '(только показать координаты)'
+        )
+    )
+    parser.add_argument(
+        '--crop',
+        action='store_true',
+        help=(
+            'Также включить обрезку видео по ROI '
+            '(CROP_VIDEO_ENABLED=true)'
         )
     )
 
@@ -535,20 +669,54 @@ def main():
     # Выводим координаты
     x, y, w, h = roi
     print("\n" + "=" * 60)
-    print("📋 Координаты ROI:")
+    print("📋 Координаты ROI (детекция движения):")
     print(f"   ROI_X={x}")
     print(f"   ROI_Y={y}")
     print(f"   ROI_WIDTH={w}")
     print(f"   ROI_HEIGHT={h}")
     print("=" * 60)
     
+    # Спрашиваем про обрезку видео
+    enable_crop = args.crop
+    if not args.no_save and not args.crop:
+        print(
+            "\n🔲 Включить обрезку видео по этой "
+            "области?"
+        )
+        print(
+            "   (видео будет обрезано до ROI и "
+            "отправлено в Telegram крупным планом)"
+        )
+        try:
+            answer = input(
+                "   [y/N]: "
+            ).strip().lower()
+            enable_crop = answer in ('y', 'yes', 'д', 'да')
+        except (EOFError, KeyboardInterrupt):
+            enable_crop = False
+    
+    if enable_crop:
+        print("   ✅ CROP_VIDEO_ENABLED=true")
+    
     # Сохраняем в конфиг
     if not args.no_save:
-        if update_config_file(args.config, roi):
+        if update_config_file(
+            args.config, roi, enable_crop
+        ):
             print(
-                f"\n✅ ROI настроен в {args.config}! "
-                "Перезапустите детектор."
+                f"\n✅ ROI настроен в "
+                f"{args.config}!"
             )
+            if enable_crop:
+                print(
+                    "   Видео будет обрезано до "
+                    f"{w}x{h}"
+                )
+                print(
+                    "   Для масштабирования: "
+                    "CROP_SCALE=1280x720"
+                )
+            print("   Перезапустите детектор:")
             print("   Native:  ./run-native.sh")
             print(
                 "   Docker:  "

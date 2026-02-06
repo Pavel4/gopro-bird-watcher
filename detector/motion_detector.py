@@ -67,6 +67,15 @@ DEFAULT_ROI_Y = 0
 DEFAULT_ROI_WIDTH = 0   # 0 = весь кадр
 DEFAULT_ROI_HEIGHT = 0  # 0 = весь кадр
 
+# Обрезка видео (отдельно от ROI детекции)
+DEFAULT_CROP_VIDEO_ENABLED = False
+DEFAULT_CROP_X = 0
+DEFAULT_CROP_Y = 0
+DEFAULT_CROP_WIDTH = 0   # 0 = fallback на ROI
+DEFAULT_CROP_HEIGHT = 0  # 0 = fallback на ROI
+DEFAULT_CROP_SCALE = ""  # "1280x720" или ""
+DEFAULT_CROP_PAD = 0     # отступ от ROI (px)
+
 # USB Webcam режим (альтернатива RTMP)
 DEFAULT_INPUT_SOURCE = "rtmp"  # "rtmp" или "usb"
 DEFAULT_USB_DEVICE = "/dev/video0"
@@ -361,10 +370,10 @@ class SegmentRecorder:
                     "-video_size", resolution,
                     "-i", ffmpeg_device,
                     "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-tune", "zerolatency",
-                    "-g", "30",
-                    "-crf", "23",
+                    "-preset", "fast",
+                    "-g", "15",
+                    "-bf", "0",
+                    "-crf", "16",
                     "-f", "mpegts",
                     self.direct_output_file
                 ]
@@ -372,7 +381,8 @@ class SegmentRecorder:
                     f"  Recording: {self.direct_output_file}"
                 )
                 self.logger.info(
-                    "  Keyframe interval: 1s (-g 30)"
+                    "  Encoding: fast, CRF 16, "
+                    "keyframes every 0.5s (-g 15)"
                 )
                 self.logger.info(
                     "  Analysis: from .ts file (shared)"
@@ -696,22 +706,187 @@ class VideoMerger:
     def __init__(self, logger: logging.Logger = None):
         self.logger = logger or logging.getLogger(__name__)
     
+    @staticmethod
+    def _build_vf_filter(
+        crop_params: tuple = None,
+        scale_size: str = None,
+    ) -> str:
+        """
+        Построить FFmpeg -vf filter chain.
+        Порядок: crop → scale (сжатие после обрезки
+        для максимального качества).
+        
+        Returns:
+            Строка фильтра или "" если фильтров нет.
+        """
+        filters = []
+        if crop_params:
+            x, y, w, h = crop_params
+            filters.append(f"crop={w}:{h}:{x}:{y}")
+        if scale_size and "x" in scale_size.lower():
+            sw, sh = scale_size.lower().split("x")
+            # -2 для чётности (требование H.264)
+            filters.append(
+                f"scale={sw}:{sh}"
+                f":force_original_aspect_ratio=decrease,"
+                f"pad={sw}:{sh}:(ow-iw)/2:(oh-ih)/2"
+            )
+        return ",".join(filters)
+    
+    def _extract_from_direct(
+        self,
+        input_file: str,
+        output_path: str,
+        time_range: tuple,
+        crop_params: tuple = None,
+        scale_size: str = None,
+    ) -> bool:
+        """
+        Извлечь сегмент из непрерывной .ts записи.
+        
+        1) Копирует .ts во временный файл (избежать
+           конкурентного чтения/записи и артефактов).
+        2) Input seeking (-ss ДО -i) — FFmpeg
+           перепрыгивает к ближайшему keyframe.
+        3) Crop → Scale → Encode (сжатие ПОСЛЕ
+           обрезки = максимум качества на пиксель).
+        """
+        import shutil
+        
+        start_sec, duration_sec = time_range
+        self.logger.info(
+            f"Direct mode: extracting "
+            f"{duration_sec:.1f}s from {start_sec:.1f}s"
+        )
+        
+        # Шаг 1: ждём 2с чтобы FFmpeg-запись
+        # дописала текущий GOP до конца
+        time.sleep(2)
+        
+        # Шаг 2: копируем .ts чтобы не читать файл,
+        # в который пишет другой FFmpeg-процесс
+        temp_ts = input_file + ".extract_copy.ts"
+        try:
+            shutil.copy2(input_file, temp_ts)
+            self.logger.info(
+                f"Copied .ts for extraction: "
+                f"{os.path.getsize(temp_ts) // 1024}KB"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to copy .ts: {e}"
+            )
+            temp_ts = input_file  # fallback
+        
+        # Шаг 3: строим filter chain (crop → scale)
+        vf = self._build_vf_filter(
+            crop_params, scale_size
+        )
+        if crop_params:
+            x, y, w, h = crop_params
+            self.logger.info(
+                f"Crop: {w}x{h} at ({x},{y})"
+            )
+        if scale_size:
+            self.logger.info(f"Scale: {scale_size}")
+        
+        # Шаг 4: input seeking + re-encode
+        # -ss ДО -i = seek к ближайшему keyframe
+        # С -g 15 (keyframe каждые 0.5с) точность
+        # ±0.5с — достаточно.
+        # -err_detect ignore_err — пропустить
+        # повреждённые пакеты вместо артефактов.
+        cmd = [
+            "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
+            "-ss", str(max(0, start_sec)),
+            "-i", temp_ts,
+            "-t", str(duration_sec),
+        ]
+        
+        if vf:
+            cmd.extend(["-vf", vf])
+        
+        # Сжатие ПОСЛЕ crop/scale — меньше пикселей,
+        # выше качество на каждый пиксель.
+        # slow = лучшее сжатие, CRF 17 = высокое
+        # качество. Дольше, но без артефактов.
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "slow",
+            "-crf", "17",
+            "-an",
+            output_path,
+        ])
+        
+        self.logger.info(
+            f"Encode: slow CRF 17 "
+            f"(post-crop, max quality)"
+        )
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=300,
+            )
+            
+            success = (
+                result.returncode == 0
+                and os.path.exists(output_path)
+            )
+            
+            if not success:
+                stderr = result.stderr.decode()
+                err = [
+                    l for l in stderr.split('\n')
+                    if 'error' in l.lower()
+                ]
+                if err:
+                    self.logger.error(
+                        f"FFmpeg: {err[-1][:200]}"
+                    )
+                else:
+                    self.logger.error(
+                        f"FFmpeg failed: "
+                        f"{stderr[-500:]}"
+                    )
+            
+            return success
+        except subprocess.TimeoutExpired:
+            self.logger.error(
+                "FFmpeg extraction timed out (300s)"
+            )
+            return False
+        except Exception as e:
+            self.logger.error(f"Extract error: {e}")
+            return False
+        finally:
+            # Удаляем временную копию .ts
+            if temp_ts != input_file:
+                try:
+                    os.remove(temp_ts)
+                except Exception:
+                    pass
+    
     def merge_segments(
         self, 
         segments: list, 
         output_path: str,
         crop_params: tuple = None,
-        time_range: tuple = None
+        time_range: tuple = None,
+        scale_size: str = None
     ) -> bool:
         """
         Объединить сегменты в один файл.
         
         Args:
-            segments: Список путей к сегментам (или один файл для прямой записи)
+            segments: Список путей к сегментам
             output_path: Путь для выходного файла
-            crop_params: Кортеж (x, y, width, height) для обрезки или None
-            time_range: Кортеж (start_seconds, duration_seconds) для вырезки
-                       из непрерывной записи (macOS режим)
+            crop_params: (x, y, w, h) для обрезки
+            time_range: (start_sec, duration_sec)
+            scale_size: "WxH" для масштабирования
+                        после обрезки (например "1280x720")
         
         Returns:
             True если успешно
@@ -734,63 +909,21 @@ class VideoMerger:
         
         if len(valid_segments) != len(segments):
             self.logger.warning(
-                f"Filtered segments: {len(valid_segments)}/{len(segments)} valid"
+                f"Filtered segments: "
+                f"{len(valid_segments)}/{len(segments)} valid"
             )
         
-        # Режим прямой записи (macOS): один файл, вырезаем нужный кусок
+        # Режим прямой записи (macOS): один файл,
+        # вырезаем нужный кусок
         if len(valid_segments) == 1 and time_range:
-            start_sec, duration_sec = time_range
-            self.logger.info(
-                f"Direct recording mode: extracting {duration_sec:.1f}s "
-                f"starting at {start_sec:.1f}s"
+            return self._extract_from_direct(
+                valid_segments[0],
+                output_path,
+                time_range,
+                crop_params,
+                scale_size,
             )
-            
-            input_file = valid_segments[0]
-            # -ss ПОСЛЕ -i = output seeking (точный,
-            # но медленнее). Перекодируем для чистого
-            # начала видео (без чёрных/битых кадров).
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i", input_file,
-                "-ss", str(start_sec),
-                "-t", str(duration_sec),
-            ]
-            
-            if crop_params:
-                x, y, w, h = crop_params
-                self.logger.info(
-                    f"Applying crop: {w}x{h} at ({x}, {y})"
-                )
-                cmd.extend([
-                    "-vf", f"crop={w}:{h}:{x}:{y}",
-                ])
-
-            cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "23",
-                "-an",  # Без аудио (USB-камера)
-            ])
-            
-            cmd.append(output_path)
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=300
-            )
-            
-            success = result.returncode == 0 and os.path.exists(output_path)
-            
-            if not success:
-                stderr = result.stderr.decode()
-                error_lines = [l for l in stderr.split('\n') 
-                              if 'error' in l.lower()]
-                if error_lines:
-                    self.logger.error(f"FFmpeg error: {error_lines[-1][:200]}")
-            
-            return success
+        
         
         # Создаём временный файл со списком сегментов
         list_file = output_path + ".concat.txt"
@@ -798,37 +931,33 @@ class VideoMerger:
         try:
             with open(list_file, 'w') as f:
                 for seg in valid_segments:
-                    # Абсолютный путь для надёжности
                     abs_path = os.path.abspath(seg)
-                    escaped_path = abs_path.replace("'", "'\\''")
-                    f.write(f"file '{escaped_path}'\n")
+                    escaped = abs_path.replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
             
-            # Базовая команда
-            if crop_params:
-                # С обрезкой - нужно перекодировать видео
-                x, y, w, h = crop_params
-                self.logger.info(f"Applying crop: {w}x{h} at ({x}, {y})")
+            # Строим фильтр: crop → scale
+            vf = self._build_vf_filter(
+                crop_params, scale_size
+            )
+            
+            if vf:
+                # С фильтрами — перекодируем
                 cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-f", "concat",
-                    "-safe", "0",
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
                     "-i", list_file,
-                    "-vf", f"crop={w}:{h}:{x}:{y}",
+                    "-vf", vf,
                     "-c:v", "libx264",
-                    "-preset", "fast",
-                    "-crf", "23",
-                    "-c:a", "aac",
-                    "-b:a", "128k",
+                    "-preset", "medium",
+                    "-crf", "18",
+                    "-c:a", "aac", "-b:a", "128k",
                     output_path
                 ]
             else:
-                # Без обрезки - просто копируем потоки
+                # Без фильтров — копируем потоки
                 cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-f", "concat",
-                    "-safe", "0",
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
                     "-i", list_file,
                     "-c", "copy",
                     output_path
@@ -837,21 +966,31 @@ class VideoMerger:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=300  # Увеличен таймаут для перекодирования
+                timeout=300
             )
             
-            success = result.returncode == 0 and os.path.exists(output_path)
+            success = (
+                result.returncode == 0
+                and os.path.exists(output_path)
+            )
             
             if not success:
-                stderr_output = result.stderr.decode()
-                # Ищем реальную ошибку (пропускаем header)
-                error_lines = [l for l in stderr_output.split('\n') 
-                              if 'error' in l.lower() or 'invalid' in l.lower()]
-                if error_lines:
-                    self.logger.error(f"FFmpeg error: {error_lines[-1][:200]}")
+                stderr_out = result.stderr.decode()
+                err_lines = [
+                    l for l in stderr_out.split('\n')
+                    if 'error' in l.lower()
+                    or 'invalid' in l.lower()
+                ]
+                if err_lines:
+                    self.logger.error(
+                        f"FFmpeg error: "
+                        f"{err_lines[-1][:200]}"
+                    )
                 else:
-                    # Показываем последние строки
-                    self.logger.error(f"FFmpeg failed: {stderr_output[-500:]}")
+                    self.logger.error(
+                        f"FFmpeg failed: "
+                        f"{stderr_out[-500:]}"
+                    )
             
             return success
             
@@ -964,6 +1103,13 @@ class MotionDetector:
         roi_y: int = DEFAULT_ROI_Y,
         roi_width: int = DEFAULT_ROI_WIDTH,
         roi_height: int = DEFAULT_ROI_HEIGHT,
+        crop_video_enabled: bool = DEFAULT_CROP_VIDEO_ENABLED,
+        crop_x: int = DEFAULT_CROP_X,
+        crop_y: int = DEFAULT_CROP_Y,
+        crop_width: int = DEFAULT_CROP_WIDTH,
+        crop_height: int = DEFAULT_CROP_HEIGHT,
+        crop_scale: str = DEFAULT_CROP_SCALE,
+        crop_pad: int = DEFAULT_CROP_PAD,
         input_source: str = DEFAULT_INPUT_SOURCE,
         usb_device: str = DEFAULT_USB_DEVICE,
         usb_resolution: str = DEFAULT_USB_RESOLUTION,
@@ -990,12 +1136,21 @@ class MotionDetector:
         self.debug_motion = debug_motion
         self.segment_duration = segment_duration
         
-        # ROI (Region of Interest) - область кормушки
+        # ROI (Region of Interest) — только детекция
         self.roi_enabled = roi_enabled
         self.roi_x = roi_x
         self.roi_y = roi_y
         self.roi_width = roi_width
         self.roi_height = roi_height
+        
+        # CROP — обрезка сохраняемого видео
+        self.crop_video_enabled = crop_video_enabled
+        self.crop_x = crop_x
+        self.crop_y = crop_y
+        self.crop_width = crop_width
+        self.crop_height = crop_height
+        self.crop_scale = crop_scale
+        self.crop_pad = crop_pad
         
         # USB режим
         self.input_source = input_source.lower()
@@ -1084,15 +1239,43 @@ class MotionDetector:
         if debug_motion:
             self.logger.info(f"  DEBUG MODE: motion % will be logged")
         
-        # Логируем настройки ROI
-        if self.roi_enabled and self.roi_width > 0 and self.roi_height > 0:
+        # Логируем настройки ROI (детекция)
+        if (self.roi_enabled
+                and self.roi_width > 0
+                and self.roi_height > 0):
             self.logger.info(
-                f"  🎯 ROI ENABLED: {self.roi_width}x{self.roi_height} "
+                f"  🎯 ROI DETECT: "
+                f"{self.roi_width}x{self.roi_height} "
                 f"at ({self.roi_x}, {self.roi_y})"
             )
-            self.logger.info(
-                f"     Motion detection and video crop will use ROI area only"
-            )
+        
+        # Логируем настройки CROP (обрезка видео)
+        if self.crop_video_enabled:
+            if self.crop_pad > 0:
+                self.logger.info(
+                    f"  🔲 CROP VIDEO: "
+                    f"ROI center ± {self.crop_pad}px"
+                )
+            else:
+                cw = (
+                    self.crop_width
+                    or self.roi_width
+                )
+                ch = (
+                    self.crop_height
+                    or self.roi_height
+                )
+                cx = self.crop_x or self.roi_x
+                cy = self.crop_y or self.roi_y
+                self.logger.info(
+                    f"  🔲 CROP VIDEO: "
+                    f"{cw}x{ch} at ({cx}, {cy})"
+                )
+            if self.crop_scale:
+                self.logger.info(
+                    f"     Scale after crop: "
+                    f"{self.crop_scale}"
+                )
         
         # Storage Manager для автоматической очистки
         self.storage_manager = None
@@ -1363,6 +1546,78 @@ class MotionDetector:
         age = time.time() - os.path.getmtime(newest)
         return age < max_age
     
+    def _calc_crop_params(self) -> tuple:
+        """
+        Вычислить параметры обрезки видео.
+        
+        Три режима:
+        1) CROP_PAD > 0: центрирование на ROI
+           с отступом PAD пикселей от каждого края.
+        2) CROP_X/Y/W/H заданы: абсолютные координаты.
+        3) Иначе: fallback на координаты ROI.
+        
+        Returns:
+            (x, y, w, h) или None
+        """
+        fw = self.frame_width or 1920
+        fh = self.frame_height or 1080
+        
+        # Режим 1: отступ от центра ROI
+        if (self.crop_pad > 0
+                and self.roi_enabled
+                and self.roi_width > 0
+                and self.roi_height > 0):
+            # Центр ROI
+            cx = self.roi_x + self.roi_width // 2
+            cy = self.roi_y + self.roi_height // 2
+            # Размер crop = ROI + pad с каждой стороны
+            cw = self.roi_width + self.crop_pad * 2
+            ch = self.roi_height + self.crop_pad * 2
+            # Координаты top-left
+            x = cx - cw // 2
+            y = cy - ch // 2
+            # Ограничиваем границами кадра
+            x = max(0, x)
+            y = max(0, y)
+            if x + cw > fw:
+                cw = fw - x
+            if y + ch > fh:
+                ch = fh - y
+            # Чётность для H.264
+            cw = cw - (cw % 2)
+            ch = ch - (ch % 2)
+            if cw > 0 and ch > 0:
+                self.logger.info(
+                    f"Crop (pad {self.crop_pad}px): "
+                    f"{cw}x{ch} at ({x},{y}) "
+                    f"centered on ROI"
+                )
+                return (x, y, cw, ch)
+        
+        # Режим 2: явные CROP координаты
+        if self.crop_width > 0 and self.crop_height > 0:
+            x = min(self.crop_x, fw - 1)
+            y = min(self.crop_y, fh - 1)
+            cw = min(self.crop_width, fw - x)
+            ch = min(self.crop_height, fh - y)
+            cw = cw - (cw % 2)
+            ch = ch - (ch % 2)
+            if cw > 0 and ch > 0:
+                return (x, y, cw, ch)
+        
+        # Режим 3: fallback на ROI
+        if (self.roi_enabled
+                and self.roi_width > 0
+                and self.roi_height > 0):
+            rw = self.roi_width - (self.roi_width % 2)
+            rh = self.roi_height - (self.roi_height % 2)
+            if rw > 0 and rh > 0:
+                return (
+                    self.roi_x, self.roi_y, rw, rh
+                )
+        
+        return None
+    
     def start_recording(self, rec_type: RecordingType):
         """Начать запись видео."""
         with self.recording_lock:
@@ -1464,30 +1719,52 @@ class MotionDetector:
         # Временный файл
         temp_filepath = os.path.join(output_folder, f"{prefix}_{timestamp}_temp.mp4")
         
-        # Определяем параметры crop (если ROI включен)
+        # Определяем параметры обрезки видео
+        # CROP отдельно от ROI: ROI = детекция,
+        # CROP = обрезка сохраняемого видео
         crop_params = None
-        if self.roi_enabled and self.roi_width > 0 and self.roi_height > 0:
-            crop_params = (self.roi_x, self.roi_y, self.roi_width, self.roi_height)
+        scale_size = None
+        
+        if self.crop_video_enabled:
+            crop_params = self._calc_crop_params()
+            if self.crop_scale:
+                scale_size = self.crop_scale
         
         # Объединяем сегменты
-        self.logger.info(f"Merging {len(segments)} segments...")
+        self.logger.info(
+            f"Merging {len(segments)} segments..."
+        )
         
-        # Для режима прямой записи (macOS) вычисляем time_range
+        # Для прямой записи (macOS) вычисляем time_range
         time_range = None
-        if not self.segment_recorder.use_segments and len(segments) == 1:
-            # Вычисляем смещение от начала файла записи
-            ffmpeg_start = self.segment_recorder.recording_start_time
+        if (not self.segment_recorder.use_segments
+                and len(segments) == 1):
+            ffmpeg_start = (
+                self.segment_recorder.recording_start_time
+            )
             if ffmpeg_start:
-                start_offset = max(0, self.recording_buffer_start_time - ffmpeg_start)
-                duration = recording_end_time - self.recording_buffer_start_time
+                start_offset = max(
+                    0,
+                    self.recording_buffer_start_time
+                    - ffmpeg_start,
+                )
+                duration = (
+                    recording_end_time
+                    - self.recording_buffer_start_time
+                )
                 time_range = (start_offset, duration)
                 self.logger.info(
-                    f"Direct mode: cutting from {start_offset:.1f}s, "
-                    f"duration {duration:.1f}s"
+                    f"Direct mode: cut from "
+                    f"{start_offset:.1f}s, "
+                    f"dur {duration:.1f}s"
                 )
         
         if self.video_merger.merge_segments(
-            segments, temp_filepath, crop_params, time_range
+            segments,
+            temp_filepath,
+            crop_params,
+            time_range,
+            scale_size,
         ):
             # Проверяем что файл реально создался
             if not os.path.exists(temp_filepath):
@@ -1946,6 +2223,16 @@ def load_config(config_path: str = None) -> dict:
         "ROI_Y": str(DEFAULT_ROI_Y),
         "ROI_WIDTH": str(DEFAULT_ROI_WIDTH),
         "ROI_HEIGHT": str(DEFAULT_ROI_HEIGHT),
+        # CROP параметры (обрезка видео)
+        "CROP_VIDEO_ENABLED": str(
+            DEFAULT_CROP_VIDEO_ENABLED
+        ).lower(),
+        "CROP_X": str(DEFAULT_CROP_X),
+        "CROP_Y": str(DEFAULT_CROP_Y),
+        "CROP_WIDTH": str(DEFAULT_CROP_WIDTH),
+        "CROP_HEIGHT": str(DEFAULT_CROP_HEIGHT),
+        "CROP_SCALE": DEFAULT_CROP_SCALE,
+        "CROP_PAD": str(DEFAULT_CROP_PAD),
         # USB параметры
         "INPUT_SOURCE": DEFAULT_INPUT_SOURCE,
         "USB_DEVICE": DEFAULT_USB_DEVICE,
@@ -2032,12 +2319,27 @@ def main():
     control_file = config["CONTROL_FILE"]
     segment_duration = int(config.get("SEGMENT_DURATION", "1"))
     
-    # ROI параметры
-    roi_enabled = config.get("ROI_ENABLED", "false").lower() == "true"
+    # ROI параметры (детекция движения)
+    roi_enabled = (
+        config.get("ROI_ENABLED", "false")
+        .lower() == "true"
+    )
     roi_x = int(config.get("ROI_X", "0"))
     roi_y = int(config.get("ROI_Y", "0"))
     roi_width = int(config.get("ROI_WIDTH", "0"))
     roi_height = int(config.get("ROI_HEIGHT", "0"))
+    
+    # CROP параметры (обрезка видео, отдельно от ROI)
+    crop_video_enabled = (
+        config.get("CROP_VIDEO_ENABLED", "false")
+        .lower() == "true"
+    )
+    crop_x = int(config.get("CROP_X", "0"))
+    crop_y = int(config.get("CROP_Y", "0"))
+    crop_width = int(config.get("CROP_WIDTH", "0"))
+    crop_height = int(config.get("CROP_HEIGHT", "0"))
+    crop_scale = config.get("CROP_SCALE", "").strip()
+    crop_pad = int(config.get("CROP_PAD", "0"))
     
     # USB параметры
     input_source = config.get("INPUT_SOURCE", "rtmp").lower()
@@ -2102,6 +2404,13 @@ def main():
         roi_y=roi_y,
         roi_width=roi_width,
         roi_height=roi_height,
+        crop_video_enabled=crop_video_enabled,
+        crop_x=crop_x,
+        crop_y=crop_y,
+        crop_width=crop_width,
+        crop_height=crop_height,
+        crop_scale=crop_scale,
+        crop_pad=crop_pad,
         input_source=input_source,
         usb_device=usb_device,
         usb_resolution=usb_resolution,

@@ -1,10 +1,72 @@
 #!/bin/bash
 # Запуск детектора движения в нативной среде (без Docker)
 # Автоматически определяет платформу и использует нужный конфиг
+#
+# Флаги:
+#   --full-frame   Детектировать на всём кадре (игнорировать ROI)
+#   --no-crop      Не обрезать видео (игнорировать CROP)
 
 set -e
 
 cd "$(dirname "$0")"
+
+# Парсинг аргументов
+OVERRIDE_ROI=""
+OVERRIDE_CROP=""
+CROP_ARGS=""       # --crop X,Y,W,H
+CROP_PAD_ARG=""    # --crop-pad N
+CROP_SCALE_ARG=""  # --crop-scale WxH
+SHOW_HELP=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --full-frame|--no-roi)
+            OVERRIDE_ROI="true"
+            ;;
+        --no-crop)
+            OVERRIDE_CROP="true"
+            ;;
+        --crop)
+            shift
+            CROP_ARGS="${1:-}"
+            ;;
+        --crop-pad)
+            shift
+            CROP_PAD_ARG="${1:-}"
+            ;;
+        --crop-scale)
+            shift
+            CROP_SCALE_ARG="${1:-}"
+            ;;
+        --help|-h)
+            SHOW_HELP="true"
+            ;;
+    esac
+    shift
+done
+
+if [ -n "$SHOW_HELP" ]; then
+    echo "Использование: ./run-native.sh [флаги]"
+    echo ""
+    echo "Флаги:"
+    echo "  --full-frame       Детекция на всём кадре (игнорировать ROI)"
+    echo "  --no-crop          Не обрезать видео"
+    echo "  --crop X,Y,W,H    Обрезка: абсолютные координаты"
+    echo "                     Пример: --crop 200,50,800,600"
+    echo "  --crop-pad N       Обрезка: отступ N пикселей от ROI"
+    echo "                     Центрируется на ROI, расширяется на N px"
+    echo "                     Пример: --crop-pad 150"
+    echo "  --crop-scale WxH   Масштаб после обрезки"
+    echo "                     Пример: --crop-scale 1280x720"
+    echo ""
+    echo "Примеры:"
+    echo "  ./run-native.sh                            # из конфига"
+    echo "  ./run-native.sh --crop-pad 100             # ROI + 100px"
+    echo "  ./run-native.sh --crop 200,50,800,600      # точные координаты"
+    echo "  ./run-native.sh --crop-pad 150 --crop-scale 1280x720"
+    echo "  ./run-native.sh --full-frame               # весь кадр"
+    exit 0
+fi
 
 # Цвета для вывода
 GREEN='\033[0;32m'
@@ -188,6 +250,38 @@ if ! command -v ffmpeg &> /dev/null; then
 fi
 
 echo -e "${GREEN}✅ Все проверки пройдены${NC}"
+
+# Применяем флаги командной строки
+if [ -n "$OVERRIDE_ROI" ]; then
+    export ROI_ENABLED=false
+    echo -e "${YELLOW}🔲 --full-frame: ROI отключён, детекция на всём кадре${NC}"
+fi
+if [ -n "$OVERRIDE_CROP" ]; then
+    export CROP_VIDEO_ENABLED=false
+    echo -e "${YELLOW}🔲 --no-crop: обрезка видео отключена${NC}"
+fi
+if [ -n "$CROP_ARGS" ]; then
+    # --crop X,Y,W,H — абсолютные координаты
+    IFS=',' read -r CX CY CW CH <<< "$CROP_ARGS"
+    export CROP_VIDEO_ENABLED=true
+    export CROP_X="$CX"
+    export CROP_Y="$CY"
+    export CROP_WIDTH="$CW"
+    export CROP_HEIGHT="$CH"
+    echo -e "${GREEN}🔲 --crop: ${CW}x${CH} at (${CX},${CY})${NC}"
+fi
+if [ -n "$CROP_PAD_ARG" ]; then
+    # --crop-pad N — отступ от ROI (центрирование)
+    export CROP_VIDEO_ENABLED=true
+    export CROP_PAD="$CROP_PAD_ARG"
+    echo -e "${GREEN}🔲 --crop-pad: ${CROP_PAD_ARG}px вокруг ROI${NC}"
+fi
+if [ -n "$CROP_SCALE_ARG" ]; then
+    export CROP_VIDEO_ENABLED=true
+    export CROP_SCALE="$CROP_SCALE_ARG"
+    echo -e "${GREEN}🔲 --crop-scale: ${CROP_SCALE_ARG}${NC}"
+fi
+
 echo ""
 echo "Для остановки нажмите Ctrl+C"
 echo ""
