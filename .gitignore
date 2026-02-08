@@ -15,7 +15,7 @@ venv/
 .vscode/
 *.code-workspace
 
-# Recordings (keep folder structure)
+# Recordings (keep folder structure via .gitkeep)
 recordings/motion/*.mp4
 recordings/manual/*.mp4
 recordings/.segments/
@@ -27,5 +27,14 @@ logs/*.log
 # Control files (runtime)
 control/command
 
-# Local config (optional, may want to keep example)
-# config.env
+# Credentials (NEVER commit!)
+credentials.env
+
+# Temporary utility scripts
+get_chat_id.py
+
+# Test artifacts
+test_motion_simulation.py
+
+# Asset images from IDE
+assets/

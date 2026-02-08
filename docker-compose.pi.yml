@@ -1,0 +1,72 @@
+services:
+  # RTMP сервер (опционально - только если используете WiFi режим)
+  nginx-rtmp:
+    image: tiangolo/nginx-rtmp:latest-arm64v8
+    container_name: gopro-rtmp-server
+    ports:
+      - "1935:1935"
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./recordings:/recordings
+    restart: unless-stopped
+    # Раскомментируйте если нужен RTMP режим
+    # profiles:
+    #   - rtmp
+
+  # Детектор движения для Raspberry Pi
+  detector:
+    build:
+      context: ./detector
+      dockerfile: Dockerfile.arm64
+    container_name: gopro-detector-pi
+    privileged: true
+    volumes:
+      - .:/app
+      - /dev:/dev
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
+    environment:
+      - TZ=Europe/Moscow
+      # Загружаем из config.pi.env
+      - INPUT_SOURCE=${INPUT_SOURCE:-usb}
+      - USB_DEVICE=${USB_DEVICE:-/dev/video0}
+      - USB_RESOLUTION=${USB_RESOLUTION:-1080}
+      - USB_FPS=${USB_FPS:-30}
+      - RTMP_URL=rtmp://nginx-rtmp/live
+      - OUTPUT_DIR=/app/recordings
+      - LOG_FILE=/app/logs/motion_detector.log
+      - CONTROL_FILE=/app/control/command
+      - BUFFER_SECONDS=${BUFFER_SECONDS:-5}
+      - POST_MOTION_SECONDS=${POST_MOTION_SECONDS:-5}
+      - MIN_CONTOUR_AREA=${MIN_CONTOUR_AREA:-500}
+      - MIN_MOTION_FRAMES=${MIN_MOTION_FRAMES:-3}
+      - MOTION_AREA_PERCENT=${MOTION_AREA_PERCENT:-3.0}
+      - EXTEND_MOTION_PERCENT=${EXTEND_MOTION_PERCENT:-0.2}
+      - DEBUG_MOTION=${DEBUG_MOTION:-false}
+      - AUTO_START_MOTION=${AUTO_START_MOTION:-true}
+      - SEGMENT_DURATION=${SEGMENT_DURATION:-1}
+      - ROI_ENABLED=${ROI_ENABLED:-false}
+      - ROI_X=${ROI_X:-0}
+      - ROI_Y=${ROI_Y:-0}
+      - ROI_WIDTH=${ROI_WIDTH:-0}
+      - ROI_HEIGHT=${ROI_HEIGHT:-0}
+      # Storage Manager
+      - MAX_RECORDING_AGE_DAYS=${MAX_RECORDING_AGE_DAYS:-30}
+      - MIN_FREE_SPACE_GB=${MIN_FREE_SPACE_GB:-10}
+      - AUTO_CLEANUP_ENABLED=${AUTO_CLEANUP_ENABLED:-true}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-1}
+      # Telegram
+      - TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_SEND_ON_MOTION=${TELEGRAM_SEND_ON_MOTION:-true}
+      - TELEGRAM_SEND_MANUAL=${TELEGRAM_SEND_MANUAL:-false}
+      - TELEGRAM_MAX_VIDEO_MB=${TELEGRAM_MAX_VIDEO_MB:-45}
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+    restart: unless-stopped
