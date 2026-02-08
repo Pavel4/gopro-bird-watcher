@@ -14,21 +14,39 @@
 - Буфер: записывает N секунд **до** и **после** движения (Linux/Pi)
 - **ROI (Region of Interest)** — запись только области кормушки
 - **Управление хранилищем** — автоматическая очистка старых записей
-- **Telegram бот** — автоматическая отправка видео и команды управления
+- **Telegram бот** — отправка видео и команды управления
+- **ML-распознавание птиц** — YOLOv8n + CLIP (10 видов)
+- **Аналитика кормушки** — статистика визитов, видов, корма
 - Время по Москве в именах файлов
 
 ## Архитектура
 
+```mermaid
+flowchart LR
+    GoPro["GoPro Hero 13\n(USB-C)"] --> Host
+
+    subgraph Host ["Хост (macOS / RPi / Linux)"]
+        direction TB
+        MD["Motion Detector\nOpenCV + FFmpeg"]
+        MLBlock["ML Classification\nYOLOv8n + CLIP"]
+        Analytics["Feeder Analytics\nvisits.csv"]
+        Rec["recordings/\nmotion/ manual/"]
+        TG["Telegram Bot"]
+        Storage["Storage Manager"]
+
+        MD --> MLBlock
+        MD --> Rec
+        MLBlock --> Analytics
+        Rec --> TG
+        MLBlock -->|"caption"| TG
+        Storage --> Rec
+    end
+
+    TG --> User["Пользователь"]
 ```
-GoPro Hero 13 ──USB-C──> Хост (macOS / Raspberry Pi / Linux)
-                                │
-                          Motion Detector (Python + OpenCV + FFmpeg)
-                                │
-                                ├──> recordings/motion/   (автозаписи)
-                                ├──> recordings/manual/   (ручные записи)
-                                ├──> Storage Manager      (автоочистка)
-                                └──> Telegram Bot         (уведомления)
-```
+
+Подробные схемы архитектуры:
+[docs/ML_SPECIES.md](docs/ML_SPECIES.md#архитектура-сервиса)
 
 ## Быстрый старт
 
@@ -132,6 +150,10 @@ TELEGRAM_ENABLED=true      # Включить отправку видео в Tel
 - `/start` — приветствие
 - `/status` — статус системы
 - `/latest` — последние 5 записей
+- `/stats` — статистика визитов
+- `/species` — статистика по видам птиц
+- `/food <тип>` — задать тип корма
+- `/help` — справка по командам
 
 ## Структура проекта
 
@@ -147,18 +169,33 @@ gopro-bird-watcher/
 ├── nginx.conf                 # RTMP сервер (WiFi режим)
 ├── detector/
 │   ├── motion_detector.py     # Детектор движения
+│   ├── bird_classifier.py     # ML: YOLOv8n + CLIP
+│   ├── feeder_analytics.py    # Аналитика кормушки
 │   ├── telegram_bot.py        # Telegram бот
 │   ├── storage_manager.py     # Управление хранилищем
 │   ├── select_roi.py          # Выбор области кормушки
 │   ├── requirements.txt       # Python зависимости
 │   ├── Dockerfile
 │   └── Dockerfile.arm64
-├── scripts/                   # Утилиты и скрипты управления
+├── models/
+│   ├── species_labels.json    # Маппинг class_id -> вид
+│   ├── yolov8n.onnx           # Детектор (автозагрузка)
+│   ├── clip_visual.onnx       # CLIP encoder (обучение)
+│   └── species_head_weights.npz # Linear head
+├── scripts/
+│   ├── download_bird_images.py    # Загрузка данных iNat
+│   ├── train_species_classifier.py # Обучение CLIP
+│   ├── requirements-train.txt     # Зависимости обучения
+│   └── ...                        # Утилиты управления
+├── tests/                     # Тесты (pytest)
 ├── recordings/
 │   ├── motion/                # Автозаписи при движении
 │   └── manual/                # Ручные записи
+├── analytics/                 # CSV-файлы аналитики
+├── crops/                     # Кропы птиц (для обучения)
 ├── logs/
 ├── docs/
+│   ├── ML_SPECIES.md          # ML: архитектура и инструкции
 │   ├── BACKLOG.md             # Известные проблемы и планы
 │   ├── NATIVE_SETUP.md        # Руководство по нативному запуску
 │   ├── MACOS.md               # Специфика macOS
@@ -169,6 +206,7 @@ gopro-bird-watcher/
 
 ## Документация
 
+- [ML-распознавание видов птиц](docs/ML_SPECIES.md)
 - [Нативный запуск (macOS / Linux)](docs/NATIVE_SETUP.md)
 - [macOS: специфика](docs/MACOS.md)
 - [Raspberry Pi: развертывание](docs/RASPBERRY_PI.md)

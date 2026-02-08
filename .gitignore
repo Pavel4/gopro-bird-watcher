@@ -50,5 +50,8 @@ get_chat_id.py
 # Test artifacts
 test_motion_simulation.py
 
+# Scientific papers and datasets (downloaded)
+docs/papers/
+
 # Asset images from IDE
 assets/
