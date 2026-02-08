@@ -1,0 +1,23 @@
+# Зависимости для обучения классификатора видов птиц
+# Установка: pip install -r scripts/requirements-train.txt
+#
+# Эти зависимости нужны ТОЛЬКО для обучения.
+# Для production-инференса нужен только onnxruntime + numpy.
+
+# CLIP модель и PyTorch
+open_clip_torch>=2.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Обучение и метрики
+scikit-learn>=1.3.0
+
+# Загрузка изображений
+Pillow>=10.0.0
+
+# Прогресс-бары
+tqdm>=4.65.0
+
+# ONNX экспорт и верификация
+onnxruntime>=1.17.0
+onnxscript>=0.1.0

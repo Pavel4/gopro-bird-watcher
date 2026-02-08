@@ -33,6 +33,17 @@ control/command
 # Credentials (NEVER commit!)
 credentials.env
 
+# ML models and training data
+models/*.onnx
+models/*.onnx.data
+models/*.npz
+models/training_report.json
+models/clip_embeddings.npz
+data/
+
+# Bird crops (collected during inference)
+crops/
+
 # Temporary utility scripts
 get_chat_id.py
 

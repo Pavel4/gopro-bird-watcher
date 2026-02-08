@@ -34,6 +34,7 @@ VISITS_HEADERS = [
     "video_file",
     "hour",
     "weekday",
+    "species",
 ]
 
 FOOD_LOG_HEADERS = [
@@ -93,6 +94,7 @@ class FeederAnalytics:
         self._visit_motion_areas = []
         self._visit_max_area = 0.0
         self._last_video_file = None
+        self._current_species = None
 
         # Счётчик визитов (загружается из CSV)
         self._next_visit_id = 1
@@ -209,6 +211,7 @@ class FeederAnalytics:
             self._visit_motion_areas = [motion_percent]
             self._visit_max_area = motion_percent
             self._last_video_file = None
+            self._current_species = None
 
     def visit_update(self, motion_percent: float):
         """
@@ -280,6 +283,7 @@ class FeederAnalytics:
                 video_file,
                 start_dt.hour,
                 start_dt.weekday(),
+                self._current_species or "unknown",
             ]
             self._append_csv(self.visits_csv, row)
 
@@ -300,6 +304,16 @@ class FeederAnalytics:
             self._visit_motion_areas = []
             self._visit_max_area = 0.0
             self._last_video_file = None
+            self._current_species = None
+
+    def set_species(self, species_name: str):
+        """
+        Задать вид птицы для текущего визита.
+        Вызывается ML-модулем после классификации.
+        """
+        with self._lock:
+            if self._visit_active:
+                self._current_species = species_name
 
     # === API корма ===
 
@@ -483,6 +497,126 @@ class FeederAnalytics:
             self.logger.error(
                 f"Error updating daily stats: {e}"
             )
+
+    # === Методы статистики по видам ===
+
+    def _read_visits_csv(self) -> list:
+        """Прочитать все визиты из CSV."""
+        if not os.path.exists(self.visits_csv):
+            return []
+        try:
+            with open(
+                self.visits_csv, "r",
+                encoding="utf-8",
+            ) as f:
+                return list(csv.DictReader(f))
+        except Exception:
+            return []
+
+    def get_species_stats(self) -> dict:
+        """
+        Статистика по видам птиц.
+
+        Returns:
+            {species: {visits, avg_duration,
+                       total_duration}}
+        """
+        visits = self._read_visits_csv()
+        species_data = defaultdict(
+            lambda: {"visits": 0, "durations": []}
+        )
+
+        for v in visits:
+            sp = v.get("species", "unknown")
+            species_data[sp]["visits"] += 1
+            try:
+                dur = float(
+                    v.get("duration_sec", 0)
+                )
+                species_data[sp][
+                    "durations"
+                ].append(dur)
+            except (ValueError, TypeError):
+                pass
+
+        result = {}
+        for s, data in species_data.items():
+            durs = data["durations"]
+            result[s] = {
+                "visits": data["visits"],
+                "avg_duration": (
+                    sum(durs) / len(durs)
+                    if durs else 0
+                ),
+                "total_duration": sum(durs),
+            }
+        return result
+
+    def get_species_food_preference(self) -> dict:
+        """
+        Предпочтения корма по видам птиц.
+
+        Returns:
+            {species: {food_type: count}}
+        """
+        visits = self._read_visits_csv()
+        species_food = defaultdict(
+            lambda: defaultdict(int)
+        )
+
+        for v in visits:
+            sp = v.get("species", "unknown")
+            food = v.get("food_type", "mixed")
+            species_food[sp][food] += 1
+
+        return {
+            s: dict(f)
+            for s, f in species_food.items()
+        }
+
+    def format_species_stats(self) -> str:
+        """
+        Форматированное сообщение со статистикой
+        по видам (для Telegram /species команды).
+        """
+        stats = self.get_species_stats()
+
+        if not stats:
+            return (
+                "📊 <b>Статистика по видам</b>\n\n"
+                "Данных пока нет."
+            )
+
+        sorted_sp = sorted(
+            stats.items(),
+            key=lambda x: x[1]["visits"],
+            reverse=True,
+        )
+
+        food_prefs = (
+            self.get_species_food_preference()
+        )
+
+        lines = []
+        for name, s in sorted_sp:
+            fp = food_prefs.get(name, {})
+            food_info = ""
+            if fp:
+                top_food = max(fp, key=fp.get)
+                food_info = (
+                    f" (корм: {top_food})"
+                )
+            lines.append(
+                f"  <b>{name}</b>: "
+                f"{s['visits']} визитов, "
+                f"средн. {s['avg_duration']:.1f}с"
+                f"{food_info}"
+            )
+
+        return (
+            "📊 <b>Статистика по видам</b>\n\n"
+            + "\n".join(lines)
+        )
 
     # === Методы получения статистики ===
 

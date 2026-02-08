@@ -39,9 +39,23 @@
 
 ## Планируемые фичи
 
-### [FEATURE] ML-модель для распознавания видов птиц
+### [FEATURE] ~~ML-модель для распознавания видов птиц~~
 
-Интегрировать модель машинного обучения для автоматической классификации видов птиц на видео. Добавить название вида в caption Telegram-уведомления.
+~~Интегрировать модель машинного обучения для автоматической классификации видов птиц на видео. Добавить название вида в caption Telegram-уведомления.~~
+
+**DONE (Phase 1):** Инфраструктура ML-распознавания птиц.
+Модуль `bird_classifier.py` (YOLOv8n ONNX детекция),
+захват лучшего кадра, автосохранение кропов,
+интеграция с Telegram и аналитикой.
+
+**DONE (Phase 1.5):** CLIP-based классификатор видов.
+Скрипт загрузки данных из iNaturalist
+(`scripts/download_bird_images.py`, 10 видов
+московских кормушечных птиц).
+Скрипт обучения (`scripts/train_species_classifier.py`)
+— CLIP ViT-B/32 linear probe.
+`SpeciesClassifier` обновлён для CLIP-based инференса
+(clip_visual.onnx + species_head_weights.npz).
 
 ### [FEATURE] Веб-интерфейс для просмотра записей
 
@@ -115,16 +129,20 @@ Telegram-команды: `/stats`, `/stats week`,
 
 ### Средний приоритет
 
-#### [FEATURE] ML-распознавание видов птиц
+#### [FEATURE] ~~ML-распознавание видов птиц~~
 
-Автоматическая классификация вида птицы на видео:
-- **YOLOv8 Nano** — детекция птицы в кадре (lightweight)
-- **MobileNetV3** — классификация вида
-- Готовый проект-референс:
-  [yolowing](https://github.com/Nylio-prog/yolowing)
-- Добавление названия вида в caption Telegram-сообщения
-- Оптимизация для Raspberry Pi через ONNX Runtime
-  или TensorFlow Lite
+~~Автоматическая классификация вида птицы на видео:~~
+~~- **YOLOv8 Nano** — детекция птицы в кадре~~
+~~- **MobileNetV3** — классификация вида~~
+~~- Добавление названия вида в caption Telegram~~
+~~- Оптимизация для Raspberry Pi через ONNX Runtime~~
+
+**DONE:** Реализовано через CLIP ViT-B/32 linear probe.
+Детекция: YOLOv8n ONNX. Классификация: CLIP visual
+encoder + линейный классификатор (10 видов).
+Обучение: `scripts/train_species_classifier.py`.
+Данные: `scripts/download_bird_images.py` (iNaturalist).
+Fallback: MobileNetV3 если CLIP слишком тяжёлый для Pi.
 
 #### [FEATURE] BirdNET-PI — распознавание по звуку
 

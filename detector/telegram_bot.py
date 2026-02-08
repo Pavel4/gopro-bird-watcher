@@ -104,6 +104,9 @@ class TelegramNotifier:
         self.dp.message.register(
             self.cmd_stats, Command("stats")
         )
+        self.dp.message.register(
+            self.cmd_species, Command("species")
+        )
     
     async def cmd_start(self, message: types.Message):
         """Команда /start."""
@@ -116,6 +119,7 @@ class TelegramNotifier:
             "/latest - Последние записи\n"
             "/stats - Статистика визитов\n"
             "/food - Управление типом корма\n"
+            "/species - Статистика по видам птиц\n"
             "/help - Справка"
         )
         await message.answer(
@@ -135,6 +139,7 @@ class TelegramNotifier:
             "/stats hours - По часам (7 дней)\n"
             "/food - Текущий корм\n"
             "/food семечки - Задать тип корма\n"
+            "/species - Статистика по видам\n"
             "/help - Эта справка\n\n"
             "<b>Автоматические уведомления:</b>\n"
             "• Видео при обнаружении птицы\n"
@@ -336,6 +341,35 @@ class TelegramNotifier:
             )
             await message.answer(
                 "❌ Ошибка при получении статистики"
+            )
+
+    async def cmd_species(
+        self, message: types.Message,
+    ):
+        """Команда /species — статистика по видам."""
+        try:
+            if not self.analytics:
+                await message.answer(
+                    "ℹ️ Аналитика отключена.\n"
+                    "Включите ANALYTICS_ENABLED=true"
+                )
+                return
+
+            msg = (
+                self.analytics
+                .format_species_stats()
+            )
+            await message.answer(
+                msg, parse_mode="HTML"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Error in cmd_species: {e}",
+                exc_info=True,
+            )
+            await message.answer(
+                "❌ Ошибка при получении "
+                "статистики по видам"
             )
 
     async def send_video(

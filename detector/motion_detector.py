@@ -50,6 +50,14 @@ except ImportError:
     except ImportError:
         FeederAnalytics = None  # Будет работать без аналитики
 
+try:
+    from bird_classifier import BirdClassifier
+except ImportError:
+    try:
+        from detector.bird_classifier import BirdClassifier
+    except ImportError:
+        BirdClassifier = None  # Будет работать без ML
+
 # Московское время (UTC+3)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -115,6 +123,14 @@ DEFAULT_TELEGRAM_MAX_VIDEO_MB = 45.0
 DEFAULT_ANALYTICS_ENABLED = False
 DEFAULT_ANALYTICS_DIR = "./analytics"
 DEFAULT_FOOD_TYPE = "mixed"
+
+# ML распознавание птиц
+DEFAULT_ML_ENABLED = False
+DEFAULT_ML_MODEL_DIR = "./models"
+DEFAULT_ML_CONFIDENCE = 0.5
+DEFAULT_ML_SPECIES_ENABLED = False
+DEFAULT_ML_SAVE_CROPS = True
+DEFAULT_ML_CROPS_DIR = "./crops"
 
 
 class RecordingType(Enum):
@@ -1276,7 +1292,13 @@ class MotionDetector:
         telegram_max_video_mb: float = DEFAULT_TELEGRAM_MAX_VIDEO_MB,
         analytics_enabled: bool = DEFAULT_ANALYTICS_ENABLED,
         analytics_dir: str = DEFAULT_ANALYTICS_DIR,
-        default_food_type: str = DEFAULT_FOOD_TYPE
+        default_food_type: str = DEFAULT_FOOD_TYPE,
+        ml_enabled: bool = DEFAULT_ML_ENABLED,
+        ml_model_dir: str = DEFAULT_ML_MODEL_DIR,
+        ml_confidence: float = DEFAULT_ML_CONFIDENCE,
+        ml_species_enabled: bool = DEFAULT_ML_SPECIES_ENABLED,
+        ml_save_crops: bool = DEFAULT_ML_SAVE_CROPS,
+        ml_crops_dir: str = DEFAULT_ML_CROPS_DIR,
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -1523,6 +1545,41 @@ class MotionDetector:
         elif not analytics_enabled:
             self.logger.info(
                 "  Feeder analytics: disabled"
+            )
+        
+        # ML Bird Classifier
+        self.bird_classifier = None
+        self._best_frame = None
+        self._best_motion_percent = 0.0
+        self._last_classification = None
+
+        if ml_enabled and BirdClassifier:
+            try:
+                self.bird_classifier = BirdClassifier(
+                    model_dir=ml_model_dir,
+                    confidence_threshold=ml_confidence,
+                    species_enabled=ml_species_enabled,
+                    save_crops=ml_save_crops,
+                    crops_dir=ml_crops_dir,
+                    logger=self.logger,
+                )
+                if not self.bird_classifier.is_available():
+                    self.logger.warning(
+                        "  ⚠️ ML models not loaded"
+                    )
+                    self.bird_classifier = None
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to init BirdClassifier: {e}"
+                )
+        elif ml_enabled and not BirdClassifier:
+            self.logger.warning(
+                "  ⚠️ ML enabled but "
+                "bird_classifier.py not found"
+            )
+        elif not ml_enabled:
+            self.logger.info(
+                "  ML bird recognition: disabled"
             )
     
     def get_moscow_time(self) -> datetime:
@@ -2080,14 +2137,39 @@ class MotionDetector:
         if recording_type == RecordingType.MOTION:
             emoji = "🐦"
             type_name = "Птица обнаружена"
+            # ML: добавляем вид птицы
+            ml_result = self._last_classification
+            if (
+                ml_result
+                and self.bird_classifier
+                and ml_result.bird_detected
+            ):
+                info = (
+                    self.bird_classifier
+                    .get_caption_info(ml_result)
+                )
+                type_name = (
+                    f"{info['name']} обнаружена"
+                )
+                if info['confidence'] > 0:
+                    type_name += (
+                        f" ({info['confidence']:.0%})"
+                    )
         else:
             emoji = "🎬"
             type_name = "Ручная запись"
+        
+        # Добавляем корм если есть аналитика
+        food_line = ""
+        if self.analytics:
+            food = self.analytics.get_food_type()
+            food_line = f"\n🥜 Корм: {food}"
         
         caption = (
             f"{emoji} <b>{type_name}!</b>\n"
             f"📅 {timestamp}\n"
             f"⏱ Длительность: {duration_str}"
+            f"{food_line}"
         )
         
         # Запускаем отправку в отдельном потоке с НОВЫМ Bot
@@ -2146,6 +2228,56 @@ class MotionDetector:
         thread = Thread(target=send_video_thread, daemon=True)
         thread.start()
     
+    def _run_classification(self):
+        """
+        Запустить ML-классификацию на лучшем кадре
+        визита. Результат сохраняется в
+        self._last_classification.
+        """
+        try:
+            result = self.bird_classifier.process_frame(
+                self._best_frame
+            )
+            self._last_classification = result
+
+            if result.bird_detected:
+                caption_info = (
+                    self.bird_classifier
+                    .get_caption_info(result)
+                )
+                self.logger.info(
+                    f"  🧠 ML: {caption_info['name']}"
+                    f" ({caption_info['confidence']:.0%})"
+                )
+                # Сохраняем кроп для обучения
+                visit_id = self.stats.get(
+                    'significant_motion_events', 0
+                )
+                self.bird_classifier.save_crop(
+                    self._best_frame,
+                    result,
+                    visit_id=visit_id,
+                )
+                # Передаём вид в аналитику
+                if self.analytics:
+                    species = (
+                        self.bird_classifier
+                        .get_species_name(result)
+                    )
+                    self.analytics.set_species(
+                        species
+                    )
+            else:
+                self.logger.info(
+                    "  🧠 ML: no bird detected "
+                    "in best frame"
+                )
+        except Exception as e:
+            self.logger.error(
+                f"ML classification error: {e}",
+                exc_info=True,
+            )
+
     def process_frame(self, frame: np.ndarray):
         """Обработка одного кадра."""
         current_time = time.time()
@@ -2178,6 +2310,15 @@ class MotionDetector:
                 self.analytics.visit_update(
                     motion_percent
                 )
+            # ML: обновляем лучший кадр
+            if (
+                motion_percent
+                > self._best_motion_percent
+            ):
+                self._best_frame = frame.copy()
+                self._best_motion_percent = (
+                    motion_percent
+                )
         
         if significant_motion:
             self.consecutive_motion_frames += 1
@@ -2200,6 +2341,12 @@ class MotionDetector:
                         self.analytics.visit_started(
                             motion_percent
                         )
+                    # ML: сброс лучшего кадра
+                    self._best_frame = frame.copy()
+                    self._best_motion_percent = (
+                        motion_percent
+                    )
+                    self._last_classification = None
                     
                     # Начинаем MOTION запись
                     if self.motion_detection_enabled and not self.is_recording:
@@ -2225,6 +2372,13 @@ class MotionDetector:
             if time_since_last_motion > self.post_motion_seconds:
                 self.significant_motion_started = False
                 self._last_countdown = -1  # Reset countdown
+                # ML: классификация лучшего кадра
+                if (
+                    self.bird_classifier
+                    and self._best_frame is not None
+                ):
+                    self._run_classification()
+
                 # Аналитика: конец визита
                 if self.analytics:
                     self.analytics.visit_ended()
@@ -2308,6 +2462,22 @@ class MotionDetector:
                 self.analytics.get_summary()
                 if self.analytics else None
             ),
+            'ml': {
+                'enabled': (
+                    self.bird_classifier is not None
+                ),
+                'last_classification': (
+                    self.bird_classifier
+                    .get_caption_info(
+                        self._last_classification
+                    )
+                    if (
+                        self.bird_classifier
+                        and self._last_classification
+                    )
+                    else None
+                ),
+            },
         }
     
     def run(self):
@@ -2470,6 +2640,21 @@ def load_config(config_path: str = None) -> dict:
         ).lower(),
         "ANALYTICS_DIR": DEFAULT_ANALYTICS_DIR,
         "DEFAULT_FOOD_TYPE": DEFAULT_FOOD_TYPE,
+        # ML распознавание птиц
+        "ML_ENABLED": str(
+            DEFAULT_ML_ENABLED
+        ).lower(),
+        "ML_MODEL_DIR": DEFAULT_ML_MODEL_DIR,
+        "ML_CONFIDENCE_THRESHOLD": str(
+            DEFAULT_ML_CONFIDENCE
+        ),
+        "ML_SPECIES_ENABLED": str(
+            DEFAULT_ML_SPECIES_ENABLED
+        ).lower(),
+        "ML_SAVE_CROPS": str(
+            DEFAULT_ML_SAVE_CROPS
+        ).lower(),
+        "ML_CROPS_DIR": DEFAULT_ML_CROPS_DIR,
     }
     
     config = defaults.copy()
@@ -2643,6 +2828,26 @@ def main():
         "DEFAULT_FOOD_TYPE", "mixed"
     )
     
+    # ML параметры
+    ml_enabled = config.get(
+        "ML_ENABLED", "false"
+    ).lower() == "true"
+    ml_model_dir = config.get(
+        "ML_MODEL_DIR", "./models"
+    )
+    ml_confidence = float(config.get(
+        "ML_CONFIDENCE_THRESHOLD", "0.5"
+    ))
+    ml_species_enabled = config.get(
+        "ML_SPECIES_ENABLED", "false"
+    ).lower() == "true"
+    ml_save_crops = config.get(
+        "ML_SAVE_CROPS", "true"
+    ).lower() == "true"
+    ml_crops_dir = config.get(
+        "ML_CROPS_DIR", "./crops"
+    )
+    
     detector = MotionDetector(
         rtmp_url=rtmp_url,
         output_dir=output_dir,
@@ -2684,6 +2889,12 @@ def main():
         analytics_enabled=analytics_enabled,
         analytics_dir=analytics_dir,
         default_food_type=default_food_type,
+        ml_enabled=ml_enabled,
+        ml_model_dir=ml_model_dir,
+        ml_confidence=ml_confidence,
+        ml_species_enabled=ml_species_enabled,
+        ml_save_crops=ml_save_crops,
+        ml_crops_dir=ml_crops_dir,
     )
     
     def signal_handler(sig, frame):
