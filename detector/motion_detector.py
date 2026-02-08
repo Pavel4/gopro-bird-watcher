@@ -152,24 +152,48 @@ class FileCapture:
         # Подавляем h264 warnings от FFmpeg при чтении
         # растущего .ts файла (corrupted macroblock и т.п.)
         # Наши логи идут через stdout — не затронуты.
-        self._suppress_ffmpeg_warnings()
+        # Stderr подавляется ТОЛЬКО на время open,
+        # потом восстанавливается.
+        saved_fd = self._suppress_ffmpeg_warnings()
         self._reopen()
+        self._restore_stderr(saved_fd)
 
     @staticmethod
     def _suppress_ffmpeg_warnings():
-        """Перенаправить C-level stderr в /dev/null."""
+        """
+        Временно перенаправить C-level stderr
+        в /dev/null (только для OpenCV FFmpeg).
+        Сохраняем оригинальный fd для восстановления.
+        """
         try:
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull_fd, 2)  # fd 2 = stderr
+            saved_fd = os.dup(2)
+            devnull_fd = os.open(
+                os.devnull, os.O_WRONLY
+            )
+            os.dup2(devnull_fd, 2)
             os.close(devnull_fd)
+            return saved_fd
         except Exception:
-            pass
+            return None
+
+    @staticmethod
+    def _restore_stderr(saved_fd):
+        """Восстановить оригинальный stderr."""
+        if saved_fd is not None:
+            try:
+                os.dup2(saved_fd, 2)
+                os.close(saved_fd)
+            except Exception:
+                pass
 
     def _reopen(self):
         """Переоткрыть файл и перемотать к концу."""
         if self._cap:
             self._cap.release()
+        # Подавляем FFmpeg warnings при переоткрытии
+        saved = self._suppress_ffmpeg_warnings()
         self._cap = cv2.VideoCapture(self.ts_path)
+        self._restore_stderr(saved)
         if self._cap.isOpened():
             total = int(
                 self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -180,6 +204,15 @@ class FileCapture:
                     cv2.CAP_PROP_POS_FRAMES, total - 5
                 )
             self._eof_count = 0
+
+    def update_path(self, new_path):
+        """Обновить путь к файлу (после ротации)."""
+        self._log.info(
+            f"FileCapture: switching to "
+            f"{os.path.basename(new_path)}"
+        )
+        self.ts_path = new_path
+        self._reopen()
 
     def isOpened(self):
         return self._opened and os.path.exists(self.ts_path)
@@ -239,11 +272,14 @@ class SegmentRecorder:
         usb_resolution: str = "1080",
         usb_fps: int = 30
     ):
-        self.source_url = source_url  # RTMP URL или USB device path
+        self.source_url = source_url
         self.segments_dir = segments_dir
         self.segment_duration = segment_duration
         self.max_segments = max_segments
         self.logger = logger or logging.getLogger(__name__)
+        
+        # Callback при ротации файла (macOS direct)
+        self.on_file_rotated = None
         
         # Режим работы: rtmp или usb
         self.input_source = input_source.lower()
@@ -664,6 +700,12 @@ class SegmentRecorder:
                                 "✅ Recording rotated"
                                 " to new file"
                             )
+                            # Уведомляем FileCapture
+                            # о новом файле
+                            if self.on_file_rotated:
+                                self.on_file_rotated(
+                                    self.direct_output_file
+                                )
                         except Exception as e:
                             self.logger.error(
                                 f"Rotation failed: {e}"
@@ -1276,6 +1318,7 @@ class MotionDetector:
         # Состояние записи (с блокировкой для thread-safety)
         self.recording_lock = Lock()
         self.is_recording = False
+        self._finalizing = False  # Защита от race condition
         self.recording_type = RecordingType.NONE
         self.motion_detection_enabled = False
         
@@ -1403,8 +1446,14 @@ class MotionDetector:
                         recordings_dir=self.output_dir,
                         logger=self.logger
                     )
+                    # Передаём ссылку на stats чтобы
+                    # /status команда показывала данные
+                    self.telegram_notifier.detector_stats = (
+                        self.stats
+                    )
                     self.logger.info(
-                        f"  📱 TELEGRAM BOT: enabled for chat {telegram_chat_id}"
+                        f"  📱 TELEGRAM BOT: enabled "
+                        f"for chat {telegram_chat_id}"
                     )
                 except Exception as e:
                     self.logger.warning(f"Failed to init Telegram bot: {e}")
@@ -1470,6 +1519,15 @@ class MotionDetector:
                     f"{ts_file}"
                 )
                 return False
+
+            # Регистрируем callback для ротации
+            # файла (чтобы FileCapture обновлялся)
+            cap_ref = self.cap
+            self.segment_recorder.on_file_rotated = (
+                lambda new_path: cap_ref.update_path(
+                    new_path
+                )
+            )
 
             self.fps = self.usb_fps
             self.frame_width = w
@@ -1702,7 +1760,7 @@ class MotionDetector:
     def start_recording(self, rec_type: RecordingType):
         """Начать запись видео."""
         with self.recording_lock:
-            if self.is_recording:
+            if self.is_recording or self._finalizing:
                 return
             
             # Проверяем что FFmpeg пишет свежие сегменты
@@ -1738,9 +1796,11 @@ class MotionDetector:
         with self.recording_lock:
             if not self.is_recording:
                 return
-            # Помечаем сразу что не записываем (чтобы не вызвали повторно)
+            # Помечаем что идёт финализация
+            # (блокирует start_recording)
             was_recording_type = self.recording_type
             self.is_recording = False
+            self._finalizing = True
         
         # Остальная работа вне блокировки (занимает время)
         
@@ -1909,10 +1969,12 @@ class MotionDetector:
     
     def _reset_recording_state(self):
         """Сбросить состояние записи."""
-        self.is_recording = False
-        self.recording_type = RecordingType.NONE
-        self.recording_start_time = None
-        self.recording_buffer_start_time = None
+        with self.recording_lock:
+            self.is_recording = False
+            self._finalizing = False
+            self.recording_type = RecordingType.NONE
+            self.recording_start_time = None
+            self.recording_buffer_start_time = None
         
         # Возобновляем cleanup
         self.segment_recorder.resume_cleanup()
@@ -2329,14 +2391,27 @@ def load_config(config_path: str = None) -> dict:
             config[key] = env_value
     
     if config_path is None:
-        # Приоритет: config.macos.env > config.pi.env > config.env
+        # Определяем платформо-зависимый конфиг
+        system = platform.system()
+        if system == "Darwin":
+            platform_config = "config.macos.env"
+        elif os.path.exists("/proc/device-tree/model"):
+            # Raspberry Pi определяется по device-tree
+            platform_config = "config.pi.env"
+        else:
+            platform_config = "config.env"
+        
         possible_paths = [
-            "config.macos.env",  # macOS конфиг (приоритет)
-            "config.pi.env",     # Raspberry Pi конфиг
-            "config.env",        # Общий конфиг
-            os.path.join(os.path.dirname(__file__), "..", "config.macos.env"),
-            os.path.join(os.path.dirname(__file__), "..", "config.pi.env"),
-            os.path.join(os.path.dirname(__file__), "..", "config.env"),
+            platform_config,
+            "config.env",
+            os.path.join(
+                os.path.dirname(__file__),
+                "..", platform_config
+            ),
+            os.path.join(
+                os.path.dirname(__file__),
+                "..", "config.env"
+            ),
             "/app/config.env",
         ]
         for path in possible_paths:

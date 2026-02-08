@@ -130,13 +130,30 @@ def load_frame_from_file(image_path: str) -> np.ndarray:
 def detect_gopro_index() -> int:
     """
     Автоопределение индекса GoPro на macOS через FFmpeg.
+    Делегирует в motion_detector.detect_gopro_macos().
 
     Returns:
         Индекс GoPro устройства или -1 если не найдено
     """
     if platform.system() != "Darwin":
-        print("⚠️  Автоопределение GoPro поддерживается только на macOS")
+        print(
+            "⚠️  Автоопределение GoPro "
+            "поддерживается только на macOS"
+        )
         return -1
+    try:
+        from motion_detector import detect_gopro_macos
+        return detect_gopro_macos()
+    except ImportError:
+        pass
+    try:
+        from detector.motion_detector import (
+            detect_gopro_macos,
+        )
+        return detect_gopro_macos()
+    except ImportError:
+        pass
+    # Fallback: локальная реализация
     try:
         result = subprocess.run(
             [
@@ -147,15 +164,24 @@ def detect_gopro_index() -> int:
         )
         for line in result.stderr.split('\n'):
             if 'gopro' in line.lower():
-                match = re.search(r'\[(\d+)\]', line)
+                match = re.search(
+                    r'\[(\d+)\]', line
+                )
                 if match:
                     idx = int(match.group(1))
-                    print(f"✅ GoPro найдена: индекс {idx}")
+                    print(
+                        f"✅ GoPro найдена: "
+                        f"индекс {idx}"
+                    )
                     return idx
-        print("⚠️  GoPro не найдена в списке устройств")
+        print(
+            "⚠️  GoPro не найдена в списке устройств"
+        )
         return -1
     except Exception as e:
-        print(f"❌ Ошибка автоопределения GoPro: {e}")
+        print(
+            f"❌ Ошибка автоопределения GoPro: {e}"
+        )
         return -1
 
 
