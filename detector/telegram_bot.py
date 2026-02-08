@@ -5,23 +5,47 @@ Telegram Bot для GoPro Bird Watcher
 """
 
 import os
+import csv
+import json
+import shutil
 import asyncio
 import logging
 import subprocess
-from typing import Optional
-from datetime import datetime
+from typing import Optional, Dict
+from datetime import datetime, timezone, timedelta
+
+# Московское время (UTC+3)
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+# Заголовки CSV для репортов
+REPORTS_HEADERS = [
+    "timestamp",
+    "visit_id",
+    "original_species",
+    "corrected_species",
+    "confirmed",
+    "video_file",
+]
 
 try:
     from aiogram import Bot, Dispatcher, F
     from aiogram import types
     from aiogram.filters import Command
-    from aiogram.types import FSInputFile
+    from aiogram.types import (
+        FSInputFile,
+        InlineKeyboardMarkup,
+        InlineKeyboardButton,
+        CallbackQuery,
+    )
     AIOGRAM_AVAILABLE = True
 except ImportError:
     AIOGRAM_AVAILABLE = False
     Bot = None
     Dispatcher = None
     types = None
+    InlineKeyboardMarkup = None
+    InlineKeyboardButton = None
+    CallbackQuery = None
 
 
 class TelegramNotifier:
@@ -38,23 +62,28 @@ class TelegramNotifier:
         send_manual: bool = False,
         max_video_mb: float = 45.0,
         recordings_dir: str = None,
+        crops_dir: str = "./crops",
+        analytics_dir: str = "./analytics",
         logger: logging.Logger = None
     ):
         """
         Args:
             bot_token: Токен бота от @BotFather
-            chat_id: ID чата куда отправлять уведомления
-            send_on_motion: Отправлять видео при движении
-            send_manual: Отправлять видео при ручной записи
+            chat_id: ID чата куда отправлять
+            send_on_motion: Отправлять при движении
+            send_manual: Отправлять при ручной записи
             max_video_mb: Макс. размер видео (MB)
             recordings_dir: Путь к папке записей
+            crops_dir: Путь к папке кропов птиц
+            analytics_dir: Путь к папке аналитики
             logger: Логгер
         """
         if not AIOGRAM_AVAILABLE:
             raise ImportError(
-                "aiogram not installed. Install: pip install aiogram==3.24.0"
+                "aiogram not installed. "
+                "Install: pip install aiogram==3.24.0"
             )
-        
+
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.send_on_motion = send_on_motion
@@ -63,21 +92,40 @@ class TelegramNotifier:
         self.recordings_dir = (
             recordings_dir or "/app/recordings"
         )
-        self.logger = logger or logging.getLogger(__name__)
-        
+        self.crops_dir = crops_dir
+        self.analytics_dir = analytics_dir
+        self.logger = (
+            logger or logging.getLogger(__name__)
+        )
+
         # Создаем бота и диспетчер
         self.bot = Bot(token=bot_token)
         self.dp = Dispatcher()
-        
+
         # Регистрируем обработчики команд
         self._register_handlers()
-        
+
         # Для передачи статистики от детектора
         self.detector_stats = {}
-        
-        # Ссылка на аналитику (устанавливается из MotionDetector)
+
+        # Ссылка на аналитику (из MotionDetector)
         self.analytics = None
-        
+
+        # Репорты: ожидающие обратной связи
+        # {visit_id: {species_en, species_ru, ...}}
+        self._pending_reports: Dict[int, dict] = {}
+
+        # Загружаем метки видов для inline-кнопок
+        self._species_labels = (
+            self._load_species_labels()
+        )
+
+        # CSV для репортов
+        self._reports_csv = os.path.join(
+            self.analytics_dir, "species_reports.csv"
+        )
+        self._init_reports_csv()
+
         self.logger.info(
             f"TelegramNotifier initialized "
             f"for chat {chat_id}"
@@ -107,7 +155,648 @@ class TelegramNotifier:
         self.dp.message.register(
             self.cmd_species, Command("species")
         )
-    
+
+        # Callback-хэндлеры для inline-кнопок
+        self.dp.callback_query.register(
+            self.on_correct_callback,
+            F.data.startswith("correct:"),
+        )
+        self.dp.callback_query.register(
+            self.on_wrong_callback,
+            F.data.startswith("wrong:"),
+        )
+        self.dp.callback_query.register(
+            self.on_fix_callback,
+            F.data.startswith("fix:"),
+        )
+        self.dp.callback_query.register(
+            self.on_behavior_callback,
+            F.data.startswith("bhv:"),
+        )
+
+    # === Вспомогательные методы ===
+
+    def _load_species_labels(self) -> dict:
+        """Загрузить метки видов из JSON."""
+        labels_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "models",
+            "species_labels.json",
+        )
+        try:
+            with open(labels_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(
+                f"Cannot load species labels: {e}"
+            )
+            return {}
+
+    def _init_reports_csv(self):
+        """Инициализировать CSV для репортов."""
+        os.makedirs(self.analytics_dir, exist_ok=True)
+        if not os.path.exists(self._reports_csv):
+            try:
+                with open(
+                    self._reports_csv, "w",
+                    newline="", encoding="utf-8",
+                ) as f:
+                    writer = csv.writer(f)
+                    writer.writerow(REPORTS_HEADERS)
+            except Exception as e:
+                self.logger.error(
+                    f"Cannot create reports CSV: {e}"
+                )
+
+    # === Inline-клавиатуры ===
+
+    def build_species_keyboard(
+        self, visit_id: int
+    ) -> InlineKeyboardMarkup:
+        """
+        Inline-клавиатура: Верно / Неверно.
+
+        Args:
+            visit_id: ID визита для callback_data
+        Returns:
+            InlineKeyboardMarkup
+        """
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Верно",
+                        callback_data=(
+                            f"correct:{visit_id}"
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Неверно",
+                        callback_data=(
+                            f"wrong:{visit_id}"
+                        ),
+                    ),
+                ]
+            ]
+        )
+
+    def _build_correction_keyboard(
+        self, visit_id: int
+    ) -> InlineKeyboardMarkup:
+        """
+        Inline-клавиатура со списком видов
+        для исправления.
+
+        Args:
+            visit_id: ID визита
+        Returns:
+            InlineKeyboardMarkup с 10 видами
+        """
+        rows = []
+        row = []
+        for sid, info in sorted(
+            self._species_labels.items(),
+            key=lambda x: int(x[0]),
+        ):
+            btn = InlineKeyboardButton(
+                text=info["ru"],
+                callback_data=(
+                    f"fix:{visit_id}:{sid}"
+                ),
+            )
+            row.append(btn)
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+
+        # Кнопка "Не птица"
+        rows.append([
+            InlineKeyboardButton(
+                text="🚫 Не птица",
+                callback_data=(
+                    f"fix:{visit_id}:none"
+                ),
+            ),
+        ])
+        return InlineKeyboardMarkup(
+            inline_keyboard=rows
+        )
+
+    def build_behavior_keyboard(
+        self, visit_id: int
+    ) -> InlineKeyboardMarkup:
+        """
+        Inline-клавиатура для разметки поведения.
+        6 кнопок поведения для сбора данных.
+
+        Args:
+            visit_id: ID визита для callback_data
+        Returns:
+            InlineKeyboardMarkup
+        """
+        behaviors = [
+            ("🍽 Кормление", "feeding"),
+            ("🪹 Сидение", "perching"),
+            ("👀 Озирание", "alert"),
+            ("⚔️ Драка", "fighting"),
+            ("➡️ Прилёт", "arrival"),
+            ("⬅️ Улёт", "departure"),
+        ]
+        rows = []
+        row = []
+        for text, bhv_id in behaviors:
+            row.append(
+                InlineKeyboardButton(
+                    text=text,
+                    callback_data=(
+                        f"bhv:{visit_id}:{bhv_id}"
+                    ),
+                )
+            )
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        return InlineKeyboardMarkup(
+            inline_keyboard=rows
+        )
+
+    def register_pending_report(
+        self,
+        visit_id: int,
+        species_en: str,
+        species_ru: str,
+        confidence: float,
+        video_file: str = "",
+        behavior_en: str = "",
+    ):
+        """
+        Зарегистрировать ожидающий репорт.
+        Вызывается из MotionDetector при отправке
+        видео с определённым видом.
+        """
+        self._pending_reports[visit_id] = {
+            "species_en": species_en,
+            "species_ru": species_ru,
+            "confidence": confidence,
+            "video_file": video_file,
+            "behavior_en": behavior_en,
+            "date": datetime.now(
+                MOSCOW_TZ
+            ).strftime("%Y-%m-%d"),
+        }
+        # Лимит: храним не более 100 записей
+        if len(self._pending_reports) > 100:
+            oldest = min(
+                self._pending_reports.keys()
+            )
+            del self._pending_reports[oldest]
+
+    # === Callback-хэндлеры ===
+
+    async def on_correct_callback(
+        self, callback: CallbackQuery
+    ):
+        """Пользователь подтвердил вид: Верно."""
+        try:
+            visit_id = int(
+                callback.data.split(":")[1]
+            )
+            info = self._pending_reports.pop(
+                visit_id, None
+            )
+            if not info:
+                await callback.answer(
+                    "⏳ Репорт устарел"
+                )
+                return
+
+            self._save_species_report(
+                visit_id=visit_id,
+                original_species=info["species_en"],
+                corrected_species="",
+                confirmed=True,
+                video_file=info.get(
+                    "video_file", ""
+                ),
+            )
+
+            await callback.answer(
+                "✅ Спасибо! Отмечено как верное."
+            )
+            # Убираем кнопки, обновляем caption
+            if callback.message:
+                old_caption = (
+                    callback.message.caption or ""
+                )
+                new_caption = (
+                    old_caption
+                    + "\n\n✅ Вид подтверждён"
+                )
+                try:
+                    await callback.message.edit_caption(
+                        caption=new_caption[:1024],
+                        parse_mode="HTML",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            self.logger.error(
+                f"on_correct_callback error: {e}",
+                exc_info=True,
+            )
+            await callback.answer("❌ Ошибка")
+
+    async def on_wrong_callback(
+        self, callback: CallbackQuery
+    ):
+        """Пользователь нажал Неверно — показать виды."""
+        try:
+            visit_id = int(
+                callback.data.split(":")[1]
+            )
+            info = self._pending_reports.get(
+                visit_id
+            )
+            if not info:
+                await callback.answer(
+                    "⏳ Репорт устарел"
+                )
+                return
+
+            keyboard = (
+                self._build_correction_keyboard(
+                    visit_id
+                )
+            )
+            await callback.answer()
+
+            if callback.message:
+                old_caption = (
+                    callback.message.caption or ""
+                )
+                new_caption = (
+                    old_caption
+                    + "\n\n❓ Выберите правильный вид:"
+                )
+                try:
+                    await callback.message.edit_caption(
+                        caption=new_caption[:1024],
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            self.logger.error(
+                f"on_wrong_callback error: {e}",
+                exc_info=True,
+            )
+            await callback.answer("❌ Ошибка")
+
+    async def on_fix_callback(
+        self, callback: CallbackQuery
+    ):
+        """
+        Пользователь выбрал правильный вид
+        из списка.
+        """
+        try:
+            parts = callback.data.split(":")
+            visit_id = int(parts[1])
+            species_id = parts[2]
+
+            info = self._pending_reports.pop(
+                visit_id, None
+            )
+            if not info:
+                await callback.answer(
+                    "⏳ Репорт устарел"
+                )
+                return
+
+            # Определяем правильный вид
+            if species_id == "none":
+                corrected_en = "not_a_bird"
+                corrected_ru = "Не птица"
+            else:
+                label = self._species_labels.get(
+                    species_id, {}
+                )
+                corrected_en = label.get(
+                    "en", f"unknown_{species_id}"
+                )
+                corrected_ru = label.get(
+                    "ru", corrected_en
+                )
+
+            self._save_species_report(
+                visit_id=visit_id,
+                original_species=info["species_en"],
+                corrected_species=corrected_en,
+                confirmed=False,
+                video_file=info.get(
+                    "video_file", ""
+                ),
+            )
+
+            # Копируем кроп для переобучения
+            if corrected_en != "not_a_bird":
+                self._copy_crop_for_retraining(
+                    visit_id=visit_id,
+                    correct_species_en=corrected_en,
+                    date_str=info.get("date", ""),
+                )
+
+            await callback.answer(
+                f"✅ Исправлено на: {corrected_ru}"
+            )
+
+            if callback.message:
+                old_caption = (
+                    callback.message.caption or ""
+                )
+                # Убираем "Выберите правильный вид"
+                old_caption = old_caption.replace(
+                    "\n\n❓ Выберите правильный вид:",
+                    "",
+                )
+                new_caption = (
+                    old_caption
+                    + f"\n\n🔄 Исправлено: "
+                    f"{corrected_ru}"
+                )
+                try:
+                    await callback.message.edit_caption(
+                        caption=new_caption[:1024],
+                        parse_mode="HTML",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            self.logger.error(
+                f"on_fix_callback error: {e}",
+                exc_info=True,
+            )
+            await callback.answer("❌ Ошибка")
+
+    async def on_behavior_callback(
+        self, callback: CallbackQuery
+    ):
+        """
+        Пользователь выбрал поведение птицы.
+        Сохраняет данные для обучения модели.
+        """
+        try:
+            parts = callback.data.split(":")
+            if len(parts) < 3:
+                await callback.answer(
+                    "❌ Ошибка формата"
+                )
+                return
+
+            visit_id = int(parts[1])
+            behavior_en = parts[2]
+
+            behavior_names = {
+                "feeding": "Кормление",
+                "perching": "Сидение",
+                "alert": "Озирание",
+                "fighting": "Драка",
+                "arrival": "Прилёт",
+                "departure": "Улёт",
+            }
+            behavior_ru = behavior_names.get(
+                behavior_en, behavior_en
+            )
+
+            # Сохраняем в CSV для обучения
+            self._save_behavior_report(
+                visit_id=visit_id,
+                behavior_en=behavior_en,
+            )
+
+            await callback.answer(
+                f"🎭 Поведение: {behavior_ru}"
+            )
+
+            if callback.message:
+                old_caption = (
+                    callback.message.caption or ""
+                )
+                new_caption = (
+                    old_caption
+                    + f"\n\n🎭 Размечено: "
+                    f"{behavior_ru}"
+                )
+                try:
+                    await (
+                        callback.message
+                        .edit_caption(
+                            caption=(
+                                new_caption[:1024]
+                            ),
+                            parse_mode="HTML",
+                            reply_markup=None,
+                        )
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            self.logger.error(
+                f"on_behavior_callback "
+                f"error: {e}",
+                exc_info=True,
+            )
+            await callback.answer("❌ Ошибка")
+
+    def _save_behavior_report(
+        self,
+        visit_id: int,
+        behavior_en: str,
+    ):
+        """
+        Сохранить разметку поведения в CSV.
+        Файл: analytics/behavior_reports.csv
+        """
+        behavior_csv = os.path.join(
+            self.analytics_dir,
+            "behavior_reports.csv",
+        )
+        headers = [
+            "timestamp",
+            "visit_id",
+            "behavior",
+        ]
+        # Создаём файл если нет
+        if not os.path.exists(behavior_csv):
+            try:
+                with open(
+                    behavior_csv, "w",
+                    newline="", encoding="utf-8",
+                ) as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+            except Exception as e:
+                self.logger.error(
+                    f"Cannot create behavior "
+                    f"CSV: {e}"
+                )
+                return
+        # Записываем
+        try:
+            timestamp = datetime.now(
+                MOSCOW_TZ
+            ).isoformat()
+            row = [
+                timestamp,
+                visit_id,
+                behavior_en,
+            ]
+            with open(
+                behavior_csv, "a",
+                newline="", encoding="utf-8",
+            ) as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            self.logger.info(
+                f"Behavior report saved: "
+                f"visit={visit_id}, "
+                f"behavior={behavior_en}"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Error saving behavior "
+                f"report: {e}"
+            )
+
+    # === Сохранение репортов ===
+
+    def _save_species_report(
+        self,
+        visit_id: int,
+        original_species: str,
+        corrected_species: str,
+        confirmed: bool,
+        video_file: str = "",
+    ):
+        """Сохранить репорт в CSV."""
+        try:
+            timestamp = datetime.now(
+                MOSCOW_TZ
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            row = [
+                timestamp,
+                visit_id,
+                original_species,
+                corrected_species,
+                str(confirmed).lower(),
+                video_file,
+            ]
+            with open(
+                self._reports_csv, "a",
+                newline="", encoding="utf-8",
+            ) as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            self.logger.info(
+                f"Species report saved: "
+                f"visit={visit_id}, "
+                f"confirmed={confirmed}, "
+                f"corrected={corrected_species}"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Error saving report: {e}",
+                exc_info=True,
+            )
+
+    def _copy_crop_for_retraining(
+        self,
+        visit_id: int,
+        correct_species_en: str,
+        date_str: str = "",
+    ):
+        """
+        Скопировать кроп птицы в директорию
+        data/corrections/{species_en}/ для
+        переобучения.
+        """
+        try:
+            if not date_str:
+                date_str = datetime.now(
+                    MOSCOW_TZ
+                ).strftime("%Y-%m-%d")
+
+            prefix = f"visit_{visit_id:04d}"
+            crop_date_dir = os.path.join(
+                self.crops_dir, date_str,
+            )
+
+            if not os.path.isdir(crop_date_dir):
+                self.logger.warning(
+                    f"Crop dir not found: "
+                    f"{crop_date_dir}"
+                )
+                return
+
+            # Ищем кропы данного визита
+            crop_files = [
+                f for f in os.listdir(crop_date_dir)
+                if f.startswith(prefix)
+                and "bird" in f
+            ]
+
+            if not crop_files:
+                self.logger.warning(
+                    f"No crops for {prefix} in "
+                    f"{crop_date_dir}"
+                )
+                return
+
+            # Папка назначения
+            corrections_dir = os.path.join(
+                os.path.dirname(
+                    os.path.dirname(__file__)
+                ),
+                "data",
+                "corrections",
+                correct_species_en.lower().replace(
+                    " ", "_"
+                ),
+            )
+            os.makedirs(corrections_dir, exist_ok=True)
+
+            for fname in crop_files:
+                src = os.path.join(
+                    crop_date_dir, fname
+                )
+                dst = os.path.join(
+                    corrections_dir, fname
+                )
+                shutil.copy2(src, dst)
+                self.logger.info(
+                    f"Crop copied: {fname} -> "
+                    f"{corrections_dir}"
+                )
+
+        except Exception as e:
+            self.logger.error(
+                f"Error copying crop: {e}",
+                exc_info=True,
+            )
+
+    # === Команды бота ===
+
     async def cmd_start(self, message: types.Message):
         """Команда /start."""
         welcome_text = (
@@ -134,7 +823,7 @@ class TelegramNotifier:
             "/status - Статус системы\n"
             "/latest - Последние 5 записей\n"
             "/stats - Статистика за сегодня\n"
-            "/stats week - Статистика за неделю\n"
+            "/stats week - За неделю\n"
             "/stats food - Сравнение корма\n"
             "/stats hours - По часам (7 дней)\n"
             "/food - Текущий корм\n"
@@ -143,7 +832,14 @@ class TelegramNotifier:
             "/help - Эта справка\n\n"
             "<b>Автоматические уведомления:</b>\n"
             "• Видео при обнаружении птицы\n"
-            "• Сжатие если > 50MB"
+            "• Сжатие если > 50MB\n\n"
+            "<b>Обратная связь по ML:</b>\n"
+            "Под каждым видео с определением "
+            "вида есть кнопки:\n"
+            "✅ Верно — подтвердить вид\n"
+            "❌ Неверно — выбрать правильный вид\n"
+            "Ваши исправления помогают улучшить "
+            "модель!"
         )
         await message.answer(
             help_text, parse_mode="HTML"

@@ -144,6 +144,27 @@ encoder + линейный классификатор (10 видов).
 Данные: `scripts/download_bird_images.py` (iNaturalist).
 Fallback: MobileNetV3 если CLIP слишком тяжёлый для Pi.
 
+#### [FEATURE] ML-распознавание поведения птиц
+
+Автоматическая классификация поведения птицы
+на кормушке:
+- **Классы:** Кормление (Feeding), Сидение
+  (Perching), Озирание (Alert), Драка (Fighting),
+  Прилёт (Arrival), Улёт (Departure)
+- **Архитектура:** TSM-MobileNetV3
+  (Temporal Shift Module + MobileNetV3 backbone)
+- Вход: буфер 8-16 кадров (1-2 секунды видео)
+- Кольцевой буфер кадров в MotionDetector
+- `BehaviorClassifier` в `bird_classifier.py`
+- Скрипт обучения `train_behavior_classifier.py`
+- Добавление поведения в caption Telegram
+- Telegram-кнопки для разметки поведения
+  (сбор данных для обучения)
+- Новое поле `behavior` в visits.csv
+- Оптимизация для Raspberry Pi через ONNX Runtime
+- **Ref:** Visual WetlandBirds Dataset (2025),
+  TSM (2019), EdgeOAR (2024)
+
 #### [FEATURE] BirdNET-PI — распознавание по звуку
 
 Интеграция с [BirdNET](https://birdnetpi.com/) для

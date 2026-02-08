@@ -132,6 +132,12 @@ DEFAULT_ML_SPECIES_ENABLED = False
 DEFAULT_ML_SAVE_CROPS = True
 DEFAULT_ML_CROPS_DIR = "./crops"
 
+# ML распознавание поведения (TSM-MobileNetV3)
+DEFAULT_ML_BEHAVIOR_ENABLED = False
+DEFAULT_ML_BEHAVIOR_NUM_FRAMES = 8
+DEFAULT_ML_BEHAVIOR_CONFIDENCE = 0.4
+DEFAULT_ML_BEHAVIOR_BUFFER_SIZE = 90
+
 
 class RecordingType(Enum):
     """Тип записи."""
@@ -1299,6 +1305,10 @@ class MotionDetector:
         ml_species_enabled: bool = DEFAULT_ML_SPECIES_ENABLED,
         ml_save_crops: bool = DEFAULT_ML_SAVE_CROPS,
         ml_crops_dir: str = DEFAULT_ML_CROPS_DIR,
+        ml_behavior_enabled: bool = DEFAULT_ML_BEHAVIOR_ENABLED,
+        ml_behavior_num_frames: int = DEFAULT_ML_BEHAVIOR_NUM_FRAMES,
+        ml_behavior_confidence: float = DEFAULT_ML_BEHAVIOR_CONFIDENCE,
+        ml_behavior_buffer_size: int = DEFAULT_ML_BEHAVIOR_BUFFER_SIZE,
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -1498,7 +1508,9 @@ class MotionDetector:
                         send_manual=telegram_send_manual,
                         max_video_mb=telegram_max_video_mb,
                         recordings_dir=self.output_dir,
-                        logger=self.logger
+                        crops_dir=ml_crops_dir,
+                        analytics_dir=analytics_dir,
+                        logger=self.logger,
                     )
                     # Передаём ссылку на stats чтобы
                     # /status команда показывала данные
@@ -1553,12 +1565,22 @@ class MotionDetector:
         self._best_motion_percent = 0.0
         self._last_classification = None
 
+        # Кольцевой буфер кадров для behavior
+        from collections import deque
+        self._frame_buffer = deque(
+            maxlen=ml_behavior_buffer_size
+        )
+        self._behavior_enabled = ml_behavior_enabled
+
         if ml_enabled and BirdClassifier:
             try:
                 self.bird_classifier = BirdClassifier(
                     model_dir=ml_model_dir,
                     confidence_threshold=ml_confidence,
                     species_enabled=ml_species_enabled,
+                    behavior_enabled=ml_behavior_enabled,
+                    behavior_num_frames=ml_behavior_num_frames,
+                    behavior_confidence=ml_behavior_confidence,
                     save_crops=ml_save_crops,
                     crops_dir=ml_crops_dir,
                     logger=self.logger,
@@ -2134,9 +2156,14 @@ class MotionDetector:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         duration_str = self.format_duration(duration)
         
+        # ML: информация о виде для кнопок
+        species_info = None
+
         if recording_type == RecordingType.MOTION:
             emoji = "🐦"
             type_name = "Птица обнаружена"
+            behavior_line = ""
+            count_line = ""
             # ML: добавляем вид птицы
             ml_result = self._last_classification
             if (
@@ -2155,9 +2182,47 @@ class MotionDetector:
                     type_name += (
                         f" ({info['confidence']:.0%})"
                     )
+                # Поведение в caption
+                if info.get('behavior'):
+                    behavior_line = (
+                        f"\n🎭 Поведение: "
+                        f"{info['behavior']}"
+                        f" ({info['behavior_confidence']:.0%})"
+                    )
+                # Количество птиц
+                if info.get('bird_count', 0) > 1:
+                    count_line = (
+                        f"\n👥 Птиц на кадре: "
+                        f"{info['bird_count']}"
+                    )
+                # Данные для inline-кнопок
+                if info.get('species'):
+                    visit_id = self.stats.get(
+                        'significant_motion_events',
+                        0,
+                    )
+                    species_info = {
+                        'species_en': (
+                            info['species']
+                        ),
+                        'species_ru': (
+                            info['name']
+                        ),
+                        'confidence': (
+                            info['confidence']
+                        ),
+                        'visit_id': visit_id,
+                        'behavior_en': (
+                            info.get(
+                                'behavior_en', ''
+                            )
+                        ),
+                    }
         else:
             emoji = "🎬"
             type_name = "Ручная запись"
+            behavior_line = ""
+            count_line = ""
         
         # Добавляем корм если есть аналитика
         food_line = ""
@@ -2169,52 +2234,140 @@ class MotionDetector:
             f"{emoji} <b>{type_name}!</b>\n"
             f"📅 {timestamp}\n"
             f"⏱ Длительность: {duration_str}"
+            f"{behavior_line}"
+            f"{count_line}"
             f"{food_line}"
         )
         
-        # Запускаем отправку в отдельном потоке с НОВЫМ Bot
+        # Inline-кнопки для обратной связи по ML
+        reply_markup = None
+        behavior_markup = None
         notifier = self.telegram_notifier
+        if species_info and notifier:
+            vid = species_info['visit_id']
+            notifier.register_pending_report(
+                visit_id=vid,
+                species_en=(
+                    species_info['species_en']
+                ),
+                species_ru=(
+                    species_info['species_ru']
+                ),
+                confidence=(
+                    species_info['confidence']
+                ),
+                video_file=os.path.basename(
+                    video_path
+                ),
+                behavior_en=(
+                    species_info.get(
+                        'behavior_en', ''
+                    )
+                ),
+            )
+            reply_markup = (
+                notifier
+                .build_species_keyboard(vid)
+            )
+            # Кнопки разметки поведения
+            behavior_markup = (
+                notifier
+                .build_behavior_keyboard(vid)
+            )
+
+        # Отправка в отдельном потоке
         logger = self.logger
-        
+        keyboard = reply_markup
+        bhv_kb = behavior_markup
+
         def send_video_thread():
             try:
                 from aiogram import Bot
                 from aiogram.types import FSInputFile
-                
+
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                
+
                 async def _send():
-                    # Создаём НОВЫЙ Bot с тем же токеном
-                    bot = Bot(token=notifier.bot_token)
+                    bot = Bot(
+                        token=notifier.bot_token
+                    )
                     try:
-                        # Проверяем размер, сжимаем если нужно
                         final_path = video_path
-                        size_mb = os.path.getsize(video_path) / (1024**2)
-                        
-                        if size_mb > notifier.max_video_mb:
+                        size_mb = (
+                            os.path.getsize(
+                                video_path
+                            ) / (1024**2)
+                        )
+
+                        if (
+                            size_mb
+                            > notifier.max_video_mb
+                        ):
                             logger.info(
-                                f"  📱 Compressing {size_mb:.1f}MB..."
+                                f"  📱 Compressing "
+                                f"{size_mb:.1f}MB..."
                             )
-                            compressed = await notifier._compress_video(video_path)
-                            if compressed and os.path.exists(compressed):
-                                final_path = compressed
-                        
-                        video_file = FSInputFile(final_path)
+                            compressed = (
+                                await notifier
+                                ._compress_video(
+                                    video_path
+                                )
+                            )
+                            if (
+                                compressed
+                                and os.path.exists(
+                                    compressed
+                                )
+                            ):
+                                final_path = (
+                                    compressed
+                                )
+
+                        video_file = FSInputFile(
+                            final_path
+                        )
                         await bot.send_video(
-                            chat_id=notifier.chat_id,
+                            chat_id=(
+                                notifier.chat_id
+                            ),
                             video=video_file,
-                            caption=caption[:1024] if caption else None,
+                            caption=(
+                                caption[:1024]
+                                if caption
+                                else None
+                            ),
                             parse_mode="HTML",
-                            supports_streaming=True
+                            supports_streaming=True,
+                            reply_markup=keyboard,
                         )
-                        
+
                         logger.info(
-                            f"  📱 Sent to Telegram: {os.path.basename(video_path)}"
+                            f"  📱 Sent to "
+                            f"Telegram: "
+                            f"{os.path.basename(video_path)}"
                         )
-                        
+
+                        # Кнопки разметки поведения
+                        if bhv_kb:
+                            await bot.send_message(
+                                chat_id=(
+                                    notifier.chat_id
+                                ),
+                                text=(
+                                    "🎭 Какое "
+                                    "поведение?"
+                                ),
+                                reply_markup=bhv_kb,
+                            )
+
                         # Удаляем сжатую версию
-                        if final_path != video_path and os.path.exists(final_path):
+                        if (
+                            final_path != video_path
+                            and os.path.exists(
+                                final_path
+                            )
+                        ):
                             os.remove(final_path)
                         
                     finally:
@@ -2235,8 +2388,15 @@ class MotionDetector:
         self._last_classification.
         """
         try:
+            # Передаём буфер кадров для behavior
+            frame_buf = (
+                self._frame_buffer
+                if self._behavior_enabled
+                else None
+            )
             result = self.bird_classifier.process_frame(
-                self._best_frame
+                self._best_frame,
+                frame_buffer=frame_buf,
             )
             self._last_classification = result
 
@@ -2245,9 +2405,21 @@ class MotionDetector:
                     self.bird_classifier
                     .get_caption_info(result)
                 )
+                behavior_str = ""
+                if caption_info.get("behavior"):
+                    behavior_str = (
+                        f" — {caption_info['behavior']}"
+                        f" ({caption_info['behavior_confidence']:.0%})"
+                    )
+                count_str = ""
+                if result.bird_count > 1:
+                    count_str = (
+                        f" [{result.bird_count} птиц]"
+                    )
                 self.logger.info(
                     f"  🧠 ML: {caption_info['name']}"
                     f" ({caption_info['confidence']:.0%})"
+                    f"{behavior_str}{count_str}"
                 )
                 # Сохраняем кроп для обучения
                 visit_id = self.stats.get(
@@ -2267,6 +2439,12 @@ class MotionDetector:
                     self.analytics.set_species(
                         species
                     )
+                    # Передаём поведение
+                    if result.behavior:
+                        self.analytics.set_behavior(
+                            result.behavior
+                            .behavior_en
+                        )
             else:
                 self.logger.info(
                     "  🧠 ML: no bird detected "
@@ -2281,7 +2459,11 @@ class MotionDetector:
     def process_frame(self, frame: np.ndarray):
         """Обработка одного кадра."""
         current_time = time.time()
-        
+
+        # Заполняем буфер кадров для behavior
+        if self._behavior_enabled:
+            self._frame_buffer.append(frame.copy())
+
         # Детекция движения
         significant_motion, motion_percent = self.detect_motion(frame)
         
@@ -2465,6 +2647,12 @@ class MotionDetector:
             'ml': {
                 'enabled': (
                     self.bird_classifier is not None
+                ),
+                'behavior_enabled': (
+                    self._behavior_enabled
+                ),
+                'frame_buffer_size': (
+                    len(self._frame_buffer)
                 ),
                 'last_classification': (
                     self.bird_classifier
@@ -2655,6 +2843,18 @@ def load_config(config_path: str = None) -> dict:
             DEFAULT_ML_SAVE_CROPS
         ).lower(),
         "ML_CROPS_DIR": DEFAULT_ML_CROPS_DIR,
+        "ML_BEHAVIOR_ENABLED": str(
+            DEFAULT_ML_BEHAVIOR_ENABLED
+        ).lower(),
+        "ML_BEHAVIOR_NUM_FRAMES": str(
+            DEFAULT_ML_BEHAVIOR_NUM_FRAMES
+        ),
+        "ML_BEHAVIOR_CONFIDENCE": str(
+            DEFAULT_ML_BEHAVIOR_CONFIDENCE
+        ),
+        "ML_BEHAVIOR_BUFFER_SIZE": str(
+            DEFAULT_ML_BEHAVIOR_BUFFER_SIZE
+        ),
     }
     
     config = defaults.copy()
@@ -2847,7 +3047,21 @@ def main():
     ml_crops_dir = config.get(
         "ML_CROPS_DIR", "./crops"
     )
-    
+
+    # ML Behavior параметры
+    ml_behavior_enabled = config.get(
+        "ML_BEHAVIOR_ENABLED", "false"
+    ).lower() == "true"
+    ml_behavior_num_frames = int(config.get(
+        "ML_BEHAVIOR_NUM_FRAMES", "8"
+    ))
+    ml_behavior_confidence = float(config.get(
+        "ML_BEHAVIOR_CONFIDENCE", "0.4"
+    ))
+    ml_behavior_buffer_size = int(config.get(
+        "ML_BEHAVIOR_BUFFER_SIZE", "90"
+    ))
+
     detector = MotionDetector(
         rtmp_url=rtmp_url,
         output_dir=output_dir,
@@ -2895,6 +3109,10 @@ def main():
         ml_species_enabled=ml_species_enabled,
         ml_save_crops=ml_save_crops,
         ml_crops_dir=ml_crops_dir,
+        ml_behavior_enabled=ml_behavior_enabled,
+        ml_behavior_num_frames=ml_behavior_num_frames,
+        ml_behavior_confidence=ml_behavior_confidence,
+        ml_behavior_buffer_size=ml_behavior_buffer_size,
     )
     
     def signal_handler(sig, frame):
