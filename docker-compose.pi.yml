@@ -65,6 +65,10 @@ services:
       - TELEGRAM_SEND_ON_MOTION=${TELEGRAM_SEND_ON_MOTION:-true}
       - TELEGRAM_SEND_MANUAL=${TELEGRAM_SEND_MANUAL:-false}
       - TELEGRAM_MAX_VIDEO_MB=${TELEGRAM_MAX_VIDEO_MB:-45}
+      # Analytics
+      - ANALYTICS_ENABLED=${ANALYTICS_ENABLED:-true}
+      - ANALYTICS_DIR=/app/analytics
+      - DEFAULT_FOOD_TYPE=${DEFAULT_FOOD_TYPE:-mixed}
     working_dir: /app
     stdin_open: true
     tty: true

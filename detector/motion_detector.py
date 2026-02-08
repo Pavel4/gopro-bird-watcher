@@ -42,6 +42,14 @@ except ImportError:
     except ImportError:
         TelegramNotifier = None  # Будет работать без Telegram
 
+try:
+    from feeder_analytics import FeederAnalytics
+except ImportError:
+    try:
+        from detector.feeder_analytics import FeederAnalytics
+    except ImportError:
+        FeederAnalytics = None  # Будет работать без аналитики
+
 # Московское время (UTC+3)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -102,6 +110,11 @@ DEFAULT_TELEGRAM_CHAT_ID = ""
 DEFAULT_TELEGRAM_SEND_ON_MOTION = True
 DEFAULT_TELEGRAM_SEND_MANUAL = False
 DEFAULT_TELEGRAM_MAX_VIDEO_MB = 45.0
+
+# Аналитика кормушки
+DEFAULT_ANALYTICS_ENABLED = False
+DEFAULT_ANALYTICS_DIR = "./analytics"
+DEFAULT_FOOD_TYPE = "mixed"
 
 
 class RecordingType(Enum):
@@ -1260,7 +1273,10 @@ class MotionDetector:
         telegram_chat_id: str = DEFAULT_TELEGRAM_CHAT_ID,
         telegram_send_on_motion: bool = DEFAULT_TELEGRAM_SEND_ON_MOTION,
         telegram_send_manual: bool = DEFAULT_TELEGRAM_SEND_MANUAL,
-        telegram_max_video_mb: float = DEFAULT_TELEGRAM_MAX_VIDEO_MB
+        telegram_max_video_mb: float = DEFAULT_TELEGRAM_MAX_VIDEO_MB,
+        analytics_enabled: bool = DEFAULT_ANALYTICS_ENABLED,
+        analytics_dir: str = DEFAULT_ANALYTICS_DIR,
+        default_food_type: str = DEFAULT_FOOD_TYPE
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -1479,6 +1495,34 @@ class MotionDetector:
             self.logger.warning(
                 "  ⚠️ Telegram enabled but aiogram not installed "
                 "(pip install aiogram==3.24.0)"
+            )
+        
+        # Feeder Analytics для сбора статистики
+        self.analytics = None
+        if analytics_enabled and FeederAnalytics:
+            try:
+                self.analytics = FeederAnalytics(
+                    analytics_dir=analytics_dir,
+                    default_food_type=default_food_type,
+                    logger=self.logger,
+                )
+                # Передаём ссылку на analytics в Telegram бот
+                if self.telegram_notifier:
+                    self.telegram_notifier.analytics = (
+                        self.analytics
+                    )
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to init FeederAnalytics: {e}"
+                )
+        elif analytics_enabled and not FeederAnalytics:
+            self.logger.warning(
+                "  ⚠️ Analytics enabled but "
+                "feeder_analytics.py not found"
+            )
+        elif not analytics_enabled:
+            self.logger.info(
+                "  Feeder analytics: disabled"
             )
     
     def get_moscow_time(self) -> datetime:
@@ -1944,6 +1988,12 @@ class MotionDetector:
                         f"(duration: {real_duration:.1f}s)"
                     )
                     
+                    # Аналитика: привязываем видео к визиту
+                    if self.analytics:
+                        self.analytics.set_last_video(
+                            final_filename
+                        )
+                    
                     # Отправить видео в Telegram (если включено)
                     self._send_to_telegram_async(
                         final_filepath,
@@ -2123,6 +2173,11 @@ class MotionDetector:
         # Обновляем время последнего движения при ЛЮБОМ движении выше порога
         if any_motion and self.significant_motion_started:
             self.last_motion_time = current_time
+            # Аналитика: обновление данных визита
+            if self.analytics:
+                self.analytics.visit_update(
+                    motion_percent
+                )
         
         if significant_motion:
             self.consecutive_motion_frames += 1
@@ -2140,6 +2195,11 @@ class MotionDetector:
                         f"(area: {motion_percent:.2f}%, "
                         f"event #{self.stats['significant_motion_events']})"
                     )
+                    # Аналитика: начало визита
+                    if self.analytics:
+                        self.analytics.visit_started(
+                            motion_percent
+                        )
                     
                     # Начинаем MOTION запись
                     if self.motion_detection_enabled and not self.is_recording:
@@ -2165,6 +2225,9 @@ class MotionDetector:
             if time_since_last_motion > self.post_motion_seconds:
                 self.significant_motion_started = False
                 self._last_countdown = -1  # Reset countdown
+                # Аналитика: конец визита
+                if self.analytics:
+                    self.analytics.visit_ended()
                 
                 total_recording_time = current_time - self.recording_start_time \
                     if self.recording_start_time else 0
@@ -2240,7 +2303,11 @@ class MotionDetector:
             'segment_recorder_running': self.segment_recorder.is_running,
             'input': input_info,
             'roi': roi_info,
-            'stats': self.stats
+            'stats': self.stats,
+            'analytics': (
+                self.analytics.get_summary()
+                if self.analytics else None
+            ),
         }
     
     def run(self):
@@ -2397,6 +2464,12 @@ def load_config(config_path: str = None) -> dict:
         "USB_DEVICE": DEFAULT_USB_DEVICE,
         "USB_RESOLUTION": DEFAULT_USB_RESOLUTION,
         "USB_FPS": str(DEFAULT_USB_FPS),
+        # Аналитика кормушки
+        "ANALYTICS_ENABLED": str(
+            DEFAULT_ANALYTICS_ENABLED
+        ).lower(),
+        "ANALYTICS_DIR": DEFAULT_ANALYTICS_DIR,
+        "DEFAULT_FOOD_TYPE": DEFAULT_FOOD_TYPE,
     }
     
     config = defaults.copy()
@@ -2559,6 +2632,17 @@ def main():
     ).lower() == "true"
     telegram_max_video_mb = float(config.get("TELEGRAM_MAX_VIDEO_MB", "45.0"))
     
+    # Analytics параметры
+    analytics_enabled = config.get(
+        "ANALYTICS_ENABLED", "false"
+    ).lower() == "true"
+    analytics_dir = config.get(
+        "ANALYTICS_DIR", "./analytics"
+    )
+    default_food_type = config.get(
+        "DEFAULT_FOOD_TYPE", "mixed"
+    )
+    
     detector = MotionDetector(
         rtmp_url=rtmp_url,
         output_dir=output_dir,
@@ -2596,7 +2680,10 @@ def main():
         telegram_chat_id=telegram_chat_id,
         telegram_send_on_motion=telegram_send_on_motion,
         telegram_send_manual=telegram_send_manual,
-        telegram_max_video_mb=telegram_max_video_mb
+        telegram_max_video_mb=telegram_max_video_mb,
+        analytics_enabled=analytics_enabled,
+        analytics_dir=analytics_dir,
+        default_food_type=default_food_type,
     )
     
     def signal_handler(sig, frame):

@@ -75,41 +75,74 @@ class TelegramNotifier:
         # Для передачи статистики от детектора
         self.detector_stats = {}
         
-        self.logger.info(f"TelegramNotifier initialized for chat {chat_id}")
+        # Ссылка на аналитику (устанавливается из MotionDetector)
+        self.analytics = None
+        
+        self.logger.info(
+            f"TelegramNotifier initialized "
+            f"for chat {chat_id}"
+        )
     
     def _register_handlers(self):
         """Регистрация обработчиков команд бота."""
         # Команды
-        self.dp.message.register(self.cmd_start, Command("start"))
-        self.dp.message.register(self.cmd_help, Command("help"))
-        self.dp.message.register(self.cmd_status, Command("status"))
-        self.dp.message.register(self.cmd_latest, Command("latest"))
+        self.dp.message.register(
+            self.cmd_start, Command("start")
+        )
+        self.dp.message.register(
+            self.cmd_help, Command("help")
+        )
+        self.dp.message.register(
+            self.cmd_status, Command("status")
+        )
+        self.dp.message.register(
+            self.cmd_latest, Command("latest")
+        )
+        self.dp.message.register(
+            self.cmd_food, Command("food")
+        )
+        self.dp.message.register(
+            self.cmd_stats, Command("stats")
+        )
     
     async def cmd_start(self, message: types.Message):
         """Команда /start."""
         welcome_text = (
             "🐦 <b>GoPro Bird Watcher Bot</b>\n\n"
-            "Я буду присылать видео при обнаружении птиц на кормушке.\n\n"
+            "Я буду присылать видео при обнаружении "
+            "птиц на кормушке.\n\n"
             "Доступные команды:\n"
             "/status - Статус системы\n"
             "/latest - Последние записи\n"
+            "/stats - Статистика визитов\n"
+            "/food - Управление типом корма\n"
             "/help - Справка"
         )
-        await message.answer(welcome_text, parse_mode="HTML")
+        await message.answer(
+            welcome_text, parse_mode="HTML"
+        )
     
     async def cmd_help(self, message: types.Message):
         """Команда /help."""
         help_text = (
             "<b>Команды бота:</b>\n\n"
             "/start - Приветствие\n"
-            "/status - Статус системы (FPS, свободное место)\n"
+            "/status - Статус системы\n"
             "/latest - Последние 5 записей\n"
+            "/stats - Статистика за сегодня\n"
+            "/stats week - Статистика за неделю\n"
+            "/stats food - Сравнение корма\n"
+            "/stats hours - По часам (7 дней)\n"
+            "/food - Текущий корм\n"
+            "/food семечки - Задать тип корма\n"
             "/help - Эта справка\n\n"
             "<b>Автоматические уведомления:</b>\n"
-            "• Видео отправляются автоматически при обнаружении птицы\n"
-            "• Если видео > 50MB, оно автоматически сжимается"
+            "• Видео при обнаружении птицы\n"
+            "• Сжатие если > 50MB"
         )
-        await message.answer(help_text, parse_mode="HTML")
+        await message.answer(
+            help_text, parse_mode="HTML"
+        )
     
     async def cmd_status(self, message: types.Message):
         """Команда /status - статус системы."""
@@ -194,6 +227,117 @@ class TelegramNotifier:
             self.logger.error(f"Error in cmd_latest: {e}", exc_info=True)
             await message.answer("❌ Ошибка при получении списка")
     
+    async def cmd_food(self, message: types.Message):
+        """
+        Команда /food — управление типом корма.
+        /food — показать текущий корм
+        /food <тип> — задать новый тип корма
+        """
+        try:
+            if not self.analytics:
+                await message.answer(
+                    "ℹ️ Аналитика отключена.\n"
+                    "Включите ANALYTICS_ENABLED=true"
+                )
+                return
+
+            # Парсим аргумент после /food
+            text = message.text or ""
+            parts = text.strip().split(maxsplit=1)
+
+            if len(parts) < 2:
+                # Просто /food — показать текущий
+                current = self.analytics.get_food_type()
+                await message.answer(
+                    f"🥜 Текущий корм: "
+                    f"<b>{current}</b>\n\n"
+                    f"Чтобы изменить:\n"
+                    f"/food семечки\n"
+                    f"/food сало\n"
+                    f"/food орехи\n"
+                    f"/food смешанный",
+                    parse_mode="HTML",
+                )
+                return
+
+            # /food <тип> — задать новый
+            new_food = parts[1].strip()
+            self.analytics.set_food_type(
+                new_food, source="telegram"
+            )
+            await message.answer(
+                f"✅ Корм изменён на: "
+                f"<b>{new_food}</b>",
+                parse_mode="HTML",
+            )
+
+        except Exception as e:
+            self.logger.error(
+                f"Error in cmd_food: {e}",
+                exc_info=True,
+            )
+            await message.answer(
+                "❌ Ошибка при обработке команды"
+            )
+
+    async def cmd_stats(self, message: types.Message):
+        """
+        Команда /stats — статистика визитов.
+        /stats — за сегодня
+        /stats week — за неделю
+        /stats food — сравнение корма
+        /stats hours — распределение по часам
+        """
+        try:
+            if not self.analytics:
+                await message.answer(
+                    "ℹ️ Аналитика отключена.\n"
+                    "Включите ANALYTICS_ENABLED=true"
+                )
+                return
+
+            # Парсим субкоманду
+            text = message.text or ""
+            parts = text.strip().split()
+            subcmd = (
+                parts[1].lower()
+                if len(parts) > 1 else "day"
+            )
+
+            if subcmd == "week":
+                msg = (
+                    self.analytics.format_weekly_stats()
+                )
+            elif subcmd == "food":
+                msg = (
+                    self.analytics
+                    .format_food_comparison()
+                )
+            elif subcmd == "hours":
+                msg = (
+                    self.analytics
+                    .format_hourly_stats(days=7)
+                )
+            else:
+                # /stats или /stats day
+                msg = (
+                    self.analytics
+                    .format_daily_stats()
+                )
+
+            await message.answer(
+                msg, parse_mode="HTML"
+            )
+
+        except Exception as e:
+            self.logger.error(
+                f"Error in cmd_stats: {e}",
+                exc_info=True,
+            )
+            await message.answer(
+                "❌ Ошибка при получении статистики"
+            )
+
     async def send_video(
         self,
         video_path: str,

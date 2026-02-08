@@ -21,6 +21,9 @@ recordings/manual/*.mp4
 recordings/.segments/
 recordings/.recording/
 
+# Analytics data (CSV files with user data)
+analytics/*.csv
+
 # Logs
 logs/*.log
 
