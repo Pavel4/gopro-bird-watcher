@@ -149,13 +149,17 @@ class FileCapture:
         self._eof_count = 0
         self._max_eof = 5  # переоткрыть после 5 EOF
         self._opened = True
+        # Lock для синхронизации доступа к self._cap
+        # между основным потоком (read) и потоком
+        # очистки (update_path -> _reopen)
+        self._lock = Lock()
         # Подавляем h264 warnings от FFmpeg при чтении
         # растущего .ts файла (corrupted macroblock и т.п.)
         # Наши логи идут через stdout — не затронуты.
         # Stderr подавляется ТОЛЬКО на время open,
         # потом восстанавливается.
         saved_fd = self._suppress_ffmpeg_warnings()
-        self._reopen()
+        self._reopen_unlocked()
         self._restore_stderr(saved_fd)
 
     @staticmethod
@@ -186,8 +190,11 @@ class FileCapture:
             except Exception:
                 pass
 
-    def _reopen(self):
-        """Переоткрыть файл и перемотать к концу."""
+    def _reopen_unlocked(self):
+        """
+        Переоткрыть файл и перемотать к концу.
+        ВНИМАНИЕ: вызывать ТОЛЬКО под self._lock!
+        """
         if self._cap:
             self._cap.release()
         # Подавляем FFmpeg warnings при переоткрытии
@@ -206,29 +213,36 @@ class FileCapture:
             self._eof_count = 0
 
     def update_path(self, new_path):
-        """Обновить путь к файлу (после ротации)."""
+        """
+        Обновить путь к файлу (после ротации).
+        Потокобезопасный: захватывает _lock.
+        """
         self._log.info(
             f"FileCapture: switching to "
             f"{os.path.basename(new_path)}"
         )
-        self.ts_path = new_path
-        self._reopen()
+        with self._lock:
+            self.ts_path = new_path
+            self._reopen_unlocked()
 
     def isOpened(self):
         return self._opened and os.path.exists(self.ts_path)
 
     def read(self):
-        if not self._opened or not self._cap:
+        if not self._opened:
             return False, None
-        ret, frame = self._cap.read()
-        if ret:
-            self._eof_count = 0
-            return True, frame
-        # EOF — файл ещё пишется, подождать
-        self._eof_count += 1
-        if self._eof_count >= self._max_eof:
-            self._reopen()
-        else:
+        with self._lock:
+            if not self._cap:
+                return False, None
+            ret, frame = self._cap.read()
+            if ret:
+                self._eof_count = 0
+                return True, frame
+            # EOF — файл ещё пишется, подождать
+            self._eof_count += 1
+            if self._eof_count >= self._max_eof:
+                self._reopen_unlocked()
+        if not ret:
             time.sleep(0.033)  # ~30fps
         return False, None
 
@@ -245,9 +259,11 @@ class FileCapture:
         pass
 
     def release(self):
-        if self._cap:
-            self._cap.release()
-        self._opened = False
+        with self._lock:
+            if self._cap:
+                self._cap.release()
+                self._cap = None
+            self._opened = False
 
 
 class SegmentRecorder:
