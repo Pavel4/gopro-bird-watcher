@@ -19,6 +19,13 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Определяем платформу
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    PLATFORM="macOS"
+else
+    PLATFORM="Linux"
+fi
+
 # Загружаем конфиг
 USB_DEVICE="${USB_DEVICE:-/dev/video0}"
 USB_RESOLUTION="${USB_RESOLUTION:-1080}"

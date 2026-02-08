@@ -82,6 +82,13 @@ DEFAULT_USB_DEVICE = "/dev/video0"
 DEFAULT_USB_RESOLUTION = "1080"  # 480, 720, 1080
 DEFAULT_USB_FPS = 30
 
+# Маппинг разрешений USB (единый для FFmpeg и OpenCV)
+RESOLUTION_MAP = {
+    "480": (854, 480),
+    "720": (1280, 720),
+    "1080": (1920, 1080),
+}
+
 # Управление хранилищем
 DEFAULT_MAX_RECORDING_AGE_DAYS = 30
 DEFAULT_MIN_FREE_SPACE_GB = 10.0
@@ -323,13 +330,10 @@ class SegmentRecorder:
         
         if self.input_source == "usb":
             # USB режим - захват с веб-камеры (зависит от платформы)
-            # Определяем разрешение
-            resolution_map = {
-                "480": "854x480",
-                "720": "1280x720",
-                "1080": "1920x1080"
-            }
-            resolution = resolution_map.get(self.usb_resolution, "1280x720")
+            w, h = RESOLUTION_MAP.get(
+                self.usb_resolution, (1280, 720)
+            )
+            resolution = f"{w}x{h}"
             
             if system == "Darwin":  # macOS - используем AVFoundation
                 # Автоопределение GoPro для FFmpeg
@@ -602,10 +606,85 @@ class SegmentRecorder:
         """Возобновить очистку сегментов."""
         self.cleanup_paused = False
     
+    def _cleanup_direct_mode(self):
+        """
+        Очистка для режима прямой записи (macOS USB).
+        Удаляет старые temp файлы и ротирует запись
+        при превышении лимита размера (2GB).
+        """
+        MAX_DIRECT_SIZE_GB = 2.0
+        while not self.stop_event.is_set():
+            try:
+                # Удаляем старые temp файлы
+                # (кроме текущего)
+                temp_files = glob.glob(
+                    os.path.join(
+                        self.segments_dir,
+                        "temp_recording_*.ts"
+                    )
+                )
+                current = self.direct_output_file
+                for f in temp_files:
+                    if f != current:
+                        try:
+                            os.remove(f)
+                            self.logger.info(
+                                f"Removed old temp: "
+                                f"{os.path.basename(f)}"
+                            )
+                        except Exception:
+                            pass
+
+                # Проверяем размер текущего файла
+                if (current
+                        and os.path.exists(current)):
+                    size_gb = (
+                        os.path.getsize(current)
+                        / (1024 ** 3)
+                    )
+                    if size_gb > MAX_DIRECT_SIZE_GB:
+                        self.logger.warning(
+                            f"⚠️ Direct file "
+                            f"{size_gb:.1f}GB "
+                            f"> {MAX_DIRECT_SIZE_GB}GB"
+                            f", rotating..."
+                        )
+                        old_file = current
+                        try:
+                            if self.ffmpeg_process:
+                                self.ffmpeg_process.kill()
+                                self.ffmpeg_process.wait(
+                                    timeout=3
+                                )
+                        except Exception:
+                            pass
+                        try:
+                            self._start_ffmpeg()
+                            self.logger.info(
+                                "✅ Recording rotated"
+                                " to new file"
+                            )
+                        except Exception as e:
+                            self.logger.error(
+                                f"Rotation failed: {e}"
+                            )
+                        # Удаляем старый файл
+                        # (новый уже пишется)
+                        time.sleep(5)
+                        try:
+                            if os.path.exists(old_file):
+                                os.remove(old_file)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            time.sleep(60)
+
     def _cleanup_old_segments(self):
         """Удаляет старые сегменты, оставляя последние max_segments."""
-        # Для режима прямой записи cleanup не нужен
+        # Для режима прямой записи — отдельная логика
         if not self.use_segments:
+            self._cleanup_direct_mode()
             return
         
         while not self.stop_event.is_set():
@@ -1248,6 +1327,10 @@ class MotionDetector:
                 f"{self.roi_width}x{self.roi_height} "
                 f"at ({self.roi_x}, {self.roi_y})"
             )
+        else:
+            self.logger.info(
+                f"  ROI disabled - using full frame"
+            )
         
         # Логируем настройки CROP (обрезка видео)
         if self.crop_video_enabled:
@@ -1298,10 +1381,9 @@ class MotionDetector:
             self.logger.info("  Storage cleanup: disabled")
         elif not StorageManager:
             self.logger.warning(
-                "  ⚠️ StorageManager not available (storage_manager.py not found)"
+                "  ⚠️ StorageManager not available "
+                "(storage_manager.py not found)"
             )
-        else:
-            self.logger.info(f"  ROI disabled - using full frame")
         
         # Telegram Bot для отправки уведомлений
         self.telegram_notifier = None
@@ -1318,6 +1400,7 @@ class MotionDetector:
                         send_on_motion=telegram_send_on_motion,
                         send_manual=telegram_send_manual,
                         max_video_mb=telegram_max_video_mb,
+                        recordings_dir=self.output_dir,
                         logger=self.logger
                     )
                     self.logger.info(
@@ -1372,12 +1455,7 @@ class MotionDetector:
                 )
                 return False
 
-            resolution_map = {
-                "480": (854, 480),
-                "720": (1280, 720),
-                "1080": (1920, 1080)
-            }
-            w, h = resolution_map.get(
+            w, h = RESOLUTION_MAP.get(
                 self.usb_resolution, (1280, 720)
             )
 
@@ -1431,12 +1509,9 @@ class MotionDetector:
             return False
         
         # Устанавливаем разрешение
-        resolution_map = {
-            "480": (854, 480),
-            "720": (1280, 720),
-            "1080": (1920, 1080)
-        }
-        width, height = resolution_map.get(self.usb_resolution, (1280, 720))
+        width, height = RESOLUTION_MAP.get(
+            self.usb_resolution, (1280, 720)
+        )
         
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
@@ -1490,14 +1565,20 @@ class MotionDetector:
         Если ROI включен - анализируется только область интереса.
         """
         # Определяем область для анализа
-        if self.roi_enabled and self.roi_width > 0 and self.roi_height > 0:
+        if (self.roi_enabled
+                and self.roi_width > 0
+                and self.roi_height > 0):
             # Обрезаем кадр до ROI области
             roi_frame = frame[
                 self.roi_y:self.roi_y + self.roi_height,
                 self.roi_x:self.roi_x + self.roi_width
             ]
             analysis_frame = roi_frame
-            analysis_area = self.roi_width * self.roi_height
+            # Используем реальные размеры обрезанного кадра
+            # (NumPy может обрезать slice если ROI выходит
+            # за границы кадра)
+            ah, aw = roi_frame.shape[:2]
+            analysis_area = aw * ah
         else:
             analysis_frame = frame
             analysis_area = self.frame_area

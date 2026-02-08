@@ -148,6 +148,22 @@
 - Графики через matplotlib или Plotly
 - Telegram-команда `/stats` — сводка за день
 
+#### [FEATURE] Улучшение качества видео (пост-обработка)
+
+Добавить FFmpeg-фильтры для улучшения качества при извлечении:
+- `hqdn3d` — шумоподавление (убирает шум от стекла и сжатия)
+- `unsharp` — повышение резкости (компенсирует размытие стекла)
+- `lanczos` scaling — качественный апскейлинг
+- Параметр: `ENHANCE_VIDEO=true`, флаг `--enhance`
+- Подробный анализ: [docs/VIDEO_QUALITY.md](VIDEO_QUALITY.md)
+
+#### [RESEARCH] OpenGoPro API — нативная запись 4K
+
+Управление GoPro через OpenGoPro API (USB/Wi-Fi) вместо
+webcam mode. Запись на SD-карту в 4K/60fps (60 Мбит/с) —
+качество в 10 раз выше чем USB-стриминг (4-8 Мбит/с).
+- Подробный анализ: [docs/VIDEO_QUALITY.md](VIDEO_QUALITY.md)
+
 ### Низкий приоритет (будущее)
 
 #### [FEATURE] Home Assistant интеграция

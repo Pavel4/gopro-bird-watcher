@@ -37,15 +37,17 @@ class TelegramNotifier:
         send_on_motion: bool = True,
         send_manual: bool = False,
         max_video_mb: float = 45.0,
+        recordings_dir: str = None,
         logger: logging.Logger = None
     ):
         """
         Args:
             bot_token: Токен бота от @BotFather
             chat_id: ID чата куда отправлять уведомления
-            send_on_motion: Отправлять видео при обнаружении движения
+            send_on_motion: Отправлять видео при движении
             send_manual: Отправлять видео при ручной записи
-            max_video_mb: Максимальный размер видео (MB), больше - сжимать
+            max_video_mb: Макс. размер видео (MB)
+            recordings_dir: Путь к папке записей
             logger: Логгер
         """
         if not AIOGRAM_AVAILABLE:
@@ -58,6 +60,9 @@ class TelegramNotifier:
         self.send_on_motion = send_on_motion
         self.send_manual = send_manual
         self.max_video_mb = max_video_mb
+        self.recordings_dir = (
+            recordings_dir or "/app/recordings"
+        )
         self.logger = logger or logging.getLogger(__name__)
         
         # Создаем бота и диспетчер
@@ -129,7 +134,9 @@ class TelegramNotifier:
             # Проверяем свободное место
             try:
                 import shutil
-                usage = shutil.disk_usage("/app/recordings")
+                usage = shutil.disk_usage(
+                    self.recordings_dir
+                )
                 free_gb = usage.free / (1024**3)
                 total_gb = usage.total / (1024**3)
                 percent_used = (usage.used / usage.total * 100)
@@ -155,8 +162,11 @@ class TelegramNotifier:
             
             # Ищем последние 5 записей
             recordings = []
+            rec_dir = self.recordings_dir
             for subdir in ["motion", "manual"]:
-                pattern = f"/app/recordings/{subdir}/*.mp4"
+                pattern = os.path.join(
+                    rec_dir, subdir, "*.mp4"
+                )
                 recordings.extend(glob.glob(pattern))
             
             if not recordings:
