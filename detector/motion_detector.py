@@ -58,6 +58,20 @@ except ImportError:
     except ImportError:
         BirdClassifier = None  # Будет работать без ML
 
+# gRPC-клиент для удалённого ML-инференса
+RemoteBirdClassifier = None
+try:
+    from inference_client import (
+        RemoteBirdClassifier,
+    )
+except ImportError:
+    try:
+        from detector.inference_client import (
+            RemoteBirdClassifier,
+        )
+    except ImportError:
+        pass  # Будет работать без remote ML
+
 # Московское время (UTC+3)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -137,6 +151,13 @@ DEFAULT_ML_BEHAVIOR_ENABLED = False
 DEFAULT_ML_BEHAVIOR_NUM_FRAMES = 8
 DEFAULT_ML_BEHAVIOR_CONFIDENCE = 0.4
 DEFAULT_ML_BEHAVIOR_BUFFER_SIZE = 90
+
+# Режим инференса: "local" или "remote" (gRPC)
+DEFAULT_INFERENCE_MODE = "local"
+DEFAULT_INFERENCE_SERVER_HOST = "localhost"
+DEFAULT_INFERENCE_SERVER_PORT = 50051
+DEFAULT_INFERENCE_JPEG_QUALITY = 90
+DEFAULT_INFERENCE_TIMEOUT = 5.0
 
 
 class RecordingType(Enum):
@@ -1309,6 +1330,11 @@ class MotionDetector:
         ml_behavior_num_frames: int = DEFAULT_ML_BEHAVIOR_NUM_FRAMES,
         ml_behavior_confidence: float = DEFAULT_ML_BEHAVIOR_CONFIDENCE,
         ml_behavior_buffer_size: int = DEFAULT_ML_BEHAVIOR_BUFFER_SIZE,
+        inference_mode: str = DEFAULT_INFERENCE_MODE,
+        inference_server_host: str = DEFAULT_INFERENCE_SERVER_HOST,
+        inference_server_port: int = DEFAULT_INFERENCE_SERVER_PORT,
+        inference_jpeg_quality: int = DEFAULT_INFERENCE_JPEG_QUALITY,
+        inference_timeout: float = DEFAULT_INFERENCE_TIMEOUT,
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -1572,7 +1598,46 @@ class MotionDetector:
         )
         self._behavior_enabled = ml_behavior_enabled
 
-        if ml_enabled and BirdClassifier:
+        if ml_enabled and inference_mode == "remote":
+            # Удалённый ML-инференс через gRPC
+            if RemoteBirdClassifier:
+                try:
+                    self.bird_classifier = (
+                        RemoteBirdClassifier(
+                            host=inference_server_host,
+                            port=inference_server_port,
+                            jpeg_quality=(
+                                inference_jpeg_quality
+                            ),
+                            timeout=inference_timeout,
+                            save_crops=ml_save_crops,
+                            crops_dir=ml_crops_dir,
+                            species_enabled=(
+                                ml_species_enabled
+                            ),
+                            behavior_enabled=(
+                                ml_behavior_enabled
+                            ),
+                            logger=self.logger,
+                        )
+                    )
+                    self.logger.info(
+                        f"  ML inference: remote "
+                        f"({inference_server_host}"
+                        f":{inference_server_port})"
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to init "
+                        f"RemoteBirdClassifier: {e}"
+                    )
+            else:
+                self.logger.warning(
+                    "  ML remote mode requested "
+                    "but inference_client.py "
+                    "not found"
+                )
+        elif ml_enabled and BirdClassifier:
             try:
                 self.bird_classifier = BirdClassifier(
                     model_dir=ml_model_dir,
@@ -1590,6 +1655,10 @@ class MotionDetector:
                         "  ⚠️ ML models not loaded"
                     )
                     self.bird_classifier = None
+                else:
+                    self.logger.info(
+                        "  ML inference: local"
+                    )
             except Exception as e:
                 self.logger.warning(
                     f"Failed to init BirdClassifier: {e}"
@@ -3062,6 +3131,23 @@ def main():
         "ML_BEHAVIOR_BUFFER_SIZE", "90"
     ))
 
+    # Режим инференса (local / remote)
+    inference_mode = config.get(
+        "INFERENCE_MODE", "local"
+    ).lower()
+    inference_server_host = config.get(
+        "INFERENCE_SERVER_HOST", "localhost"
+    )
+    inference_server_port = int(config.get(
+        "INFERENCE_SERVER_PORT", "50051"
+    ))
+    inference_jpeg_quality = int(config.get(
+        "INFERENCE_JPEG_QUALITY", "90"
+    ))
+    inference_timeout = float(config.get(
+        "INFERENCE_TIMEOUT", "5.0"
+    ))
+
     detector = MotionDetector(
         rtmp_url=rtmp_url,
         output_dir=output_dir,
@@ -3113,6 +3199,11 @@ def main():
         ml_behavior_num_frames=ml_behavior_num_frames,
         ml_behavior_confidence=ml_behavior_confidence,
         ml_behavior_buffer_size=ml_behavior_buffer_size,
+        inference_mode=inference_mode,
+        inference_server_host=inference_server_host,
+        inference_server_port=inference_server_port,
+        inference_jpeg_quality=inference_jpeg_quality,
+        inference_timeout=inference_timeout,
     )
     
     def signal_handler(sig, frame):

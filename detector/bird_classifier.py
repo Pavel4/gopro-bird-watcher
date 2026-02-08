@@ -129,6 +129,91 @@ class ClassificationResult:
     bird_count: int = 0
 
 
+def save_bird_crops(
+    frame: np.ndarray,
+    result: 'ClassificationResult',
+    crops_dir: str,
+    visit_id: int = 0,
+    logger: logging.Logger = None,
+):
+    """
+    Сохранить кропы птиц и аннотированный кадр.
+
+    Общая утилита для BirdClassifier и
+    RemoteBirdClassifier (без дублирования).
+
+    Сохраняет:
+    - Полный кадр (visit_XXXX_full.jpg)
+    - Кроп каждой детекции (visit_XXXX_bird_N.jpg)
+    - Аннотированный кадр с bbox (annotated.jpg)
+    """
+    if not result.bird_detected:
+        return
+    if result.best_detection is None:
+        return
+
+    now = datetime.now(MOSCOW_TZ)
+    date_dir = os.path.join(
+        crops_dir,
+        now.strftime("%Y-%m-%d"),
+    )
+    os.makedirs(date_dir, exist_ok=True)
+
+    prefix = f"visit_{visit_id:04d}"
+
+    # Сохраняем полный кадр
+    full_path = os.path.join(
+        date_dir, f"{prefix}_full.jpg"
+    )
+    cv2.imwrite(full_path, frame)
+
+    # Сохраняем кроп каждой детекции
+    for i, det in enumerate(result.detections):
+        x1 = max(0, det.x)
+        y1 = max(0, det.y)
+        x2 = min(
+            frame.shape[1], det.x + det.width
+        )
+        y2 = min(
+            frame.shape[0], det.y + det.height
+        )
+        crop = frame[y1:y2, x1:x2]
+        if crop.size > 0:
+            crop_path = os.path.join(
+                date_dir,
+                f"{prefix}_bird_{i}.jpg",
+            )
+            cv2.imwrite(crop_path, crop)
+
+    # Сохраняем кадр с bbox для визуализации
+    annotated = frame.copy()
+    for det in result.detections:
+        cv2.rectangle(
+            annotated,
+            (det.x, det.y),
+            (det.x + det.width,
+             det.y + det.height),
+            (0, 255, 0), 2,
+        )
+        label = f"bird {det.confidence:.0%}"
+        if result.species:
+            label = (
+                f"{result.species.species_ru} "
+                f"{result.species.confidence:.0%}"
+            )
+        cv2.putText(
+            annotated, label,
+            (det.x, det.y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6, (0, 255, 0), 2,
+        )
+
+    annotated_path = os.path.join(
+        date_dir, f"{prefix}_annotated.jpg"
+    )
+    cv2.imwrite(annotated_path, annotated)
+
+
 class BirdDetector:
     """
     Детекция птиц через YOLOv8n ONNX.
@@ -1274,78 +1359,17 @@ class BirdClassifier:
         Сохранить кроп птицы и полный кадр
         для будущего обучения.
 
-        Args:
-            frame: Полный BGR кадр
-            result: Результат классификации
-            visit_id: ID визита
+        Делегирует к save_bird_crops().
         """
         if not self.save_crops:
             return
-        if not result.bird_detected:
-            return
-        if result.best_detection is None:
-            return
-
-        now = datetime.now(MOSCOW_TZ)
-        date_dir = os.path.join(
-            self.crops_dir,
-            now.strftime("%Y-%m-%d"),
+        save_bird_crops(
+            frame=frame,
+            result=result,
+            crops_dir=self.crops_dir,
+            visit_id=visit_id,
+            logger=self.logger,
         )
-        os.makedirs(date_dir, exist_ok=True)
-
-        prefix = f"visit_{visit_id:04d}"
-
-        # Сохраняем полный кадр
-        full_path = os.path.join(
-            date_dir, f"{prefix}_full.jpg"
-        )
-        cv2.imwrite(full_path, frame)
-
-        # Сохраняем кроп каждой детекции
-        for i, det in enumerate(result.detections):
-            x1 = max(0, det.x)
-            y1 = max(0, det.y)
-            x2 = min(
-                frame.shape[1], det.x + det.width
-            )
-            y2 = min(
-                frame.shape[0], det.y + det.height
-            )
-            crop = frame[y1:y2, x1:x2]
-            if crop.size > 0:
-                crop_path = os.path.join(
-                    date_dir,
-                    f"{prefix}_bird_{i}.jpg",
-                )
-                cv2.imwrite(crop_path, crop)
-
-        # Сохраняем кадр с bbox для визуализации
-        annotated = frame.copy()
-        for det in result.detections:
-            cv2.rectangle(
-                annotated,
-                (det.x, det.y),
-                (det.x + det.width,
-                 det.y + det.height),
-                (0, 255, 0), 2,
-            )
-            label = f"bird {det.confidence:.0%}"
-            if result.species:
-                label = (
-                    f"{result.species.species_ru} "
-                    f"{result.species.confidence:.0%}"
-                )
-            cv2.putText(
-                annotated, label,
-                (det.x, det.y - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 255, 0), 2,
-            )
-
-        annotated_path = os.path.join(
-            date_dir, f"{prefix}_annotated.jpg"
-        )
-        cv2.imwrite(annotated_path, annotated)
 
     def get_species_name(
         self, result: ClassificationResult

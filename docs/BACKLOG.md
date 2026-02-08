@@ -57,6 +57,27 @@
 `SpeciesClassifier` обновлён для CLIP-based инференса
 (clip_visual.onnx + species_head_weights.npz).
 
+### [FEATURE] ~~Распределённый инференс (Edge + Compute)~~
+
+~~Разделить систему на роли: edge (Raspberry Pi — камера,
+детекция движения) и compute (PC/Mac — ML-инференс
+с GPU). Один репозиторий, разные конфиги.~~
+
+**DONE:** Реализована распределённая архитектура
+через gRPC. Три роли: `edge`, `compute`, `standalone`.
+- `proto/inference.proto` — определение gRPC-сервиса
+- `detector/inference_server.py` — gRPC-сервер
+  (роль compute), оборачивает BirdClassifier
+- `detector/inference_client.py` —
+  `RemoteBirdClassifier` с тем же интерфейсом
+  что `BirdClassifier` (Strategy pattern)
+- `motion_detector.py` — при `INFERENCE_MODE=remote`
+  прозрачно использует удалённый инференс
+- `config.compute.env` — конфиг compute-сервера
+- `docker-compose.compute.yml` — Docker для compute
+  (с поддержкой NVIDIA GPU)
+- `run-native.sh --role edge|compute|standalone`
+
 ### [FEATURE] Веб-интерфейс для просмотра записей
 
 Простой веб-интерфейс (Flask/FastAPI) для:

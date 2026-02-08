@@ -1,0 +1,74 @@
+syntax = "proto3";
+package birdwatcher;
+
+// Сервис ML-инференса для распределённой
+// архитектуры Bird Watcher.
+// Edge (Raspberry Pi) отправляет кадры,
+// Compute (PC/Mac с GPU) возвращает результат.
+service InferenceService {
+  // Классификация одного кадра:
+  // детекция птиц + вид + поведение
+  rpc ClassifyFrame(FrameRequest)
+      returns (ClassificationResponse);
+
+  // Проверка доступности сервера
+  rpc HealthCheck(HealthRequest)
+      returns (HealthResponse);
+}
+
+// === Запросы ===
+
+message FrameRequest {
+  // Основной кадр в формате JPEG
+  bytes frame_jpeg = 1;
+  // Включить классификацию вида (CLIP)
+  bool species_enabled = 2;
+  // Включить классификацию поведения (TSM)
+  bool behavior_enabled = 3;
+  // Буфер кадров для behavior (JPEG)
+  repeated bytes behavior_frames = 4;
+}
+
+message HealthRequest {}
+
+// === Ответы ===
+
+message DetectionMsg {
+  int32 class_id = 1;
+  string class_name = 2;
+  float confidence = 3;
+  int32 x = 4;
+  int32 y = 5;
+  int32 width = 6;
+  int32 height = 7;
+}
+
+message SpeciesMsg {
+  string species_ru = 1;
+  string species_en = 2;
+  float confidence = 3;
+}
+
+message BehaviorMsg {
+  string behavior_ru = 1;
+  string behavior_en = 2;
+  float confidence = 3;
+  int32 class_id = 4;
+}
+
+message ClassificationResponse {
+  bool bird_detected = 1;
+  repeated DetectionMsg detections = 2;
+  DetectionMsg best_detection = 3;
+  int32 bird_count = 4;
+  SpeciesMsg species = 5;
+  BehaviorMsg behavior = 6;
+}
+
+message HealthResponse {
+  bool ok = 1;
+  // Список загруженных моделей
+  repeated string loaded_models = 2;
+  // Используемый ONNX provider
+  string onnx_provider = 3;
+}
