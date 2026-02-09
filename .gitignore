@@ -36,10 +36,12 @@ credentials.env
 # ML models and training data
 models/*.onnx
 models/*.onnx.data
-models/*.npz
-models/training_report.json
 models/clip_embeddings.npz
+models/training_report.json
 data/
+
+# species_head_weights.npz хранится в репе (22KB)
+# Это обученная голова классификатора (10x512 + bias)
 
 # Bird crops (collected during inference)
 crops/
