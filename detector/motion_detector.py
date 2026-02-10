@@ -210,20 +210,25 @@ class FileCapture:
         # очистки (update_path -> _reopen)
         self._lock = Lock()
         # Подавляем h264 warnings от FFmpeg при чтении
-        # растущего .ts файла (corrupted macroblock и т.п.)
-        # Наши логи идут через stdout — не затронуты.
-        # Stderr подавляется ТОЛЬКО на время open,
-        # потом восстанавливается.
-        saved_fd = self._suppress_ffmpeg_warnings()
+        # растущего .ts файла (corrupted macroblock
+        # и т.п.) ПОСТОЯННО на время жизни объекта.
+        # Python logging → свои handlers (не fd 2).
+        # FFmpeg-рекордер → subprocess.PIPE (не fd 2).
+        # Поэтому перенаправление fd 2 безопасно.
+        self._saved_stderr_fd = (
+            self._suppress_stderr_permanent()
+        )
         self._reopen_unlocked()
-        self._restore_stderr(saved_fd)
 
     @staticmethod
-    def _suppress_ffmpeg_warnings():
+    def _suppress_stderr_permanent():
         """
-        Временно перенаправить C-level stderr
-        в /dev/null (только для OpenCV FFmpeg).
-        Сохраняем оригинальный fd для восстановления.
+        Перенаправить C-level stderr (fd 2) в
+        /dev/null на всё время жизни FileCapture.
+        OpenCV FFmpeg пишет h264 MB decoding errors
+        в fd 2 при каждом cap.read() — подавляем
+        их полностью. Возвращает сохранённый fd
+        для восстановления в release().
         """
         try:
             saved_fd = os.dup(2)
@@ -237,8 +242,12 @@ class FileCapture:
             return None
 
     @staticmethod
-    def _restore_stderr(saved_fd):
-        """Восстановить оригинальный stderr."""
+    def _restore_stderr_permanent(saved_fd):
+        """
+        Восстановить оригинальный stderr.
+        Вызывается из release() при завершении
+        работы FileCapture.
+        """
         if saved_fd is not None:
             try:
                 os.dup2(saved_fd, 2)
@@ -250,13 +259,12 @@ class FileCapture:
         """
         Переоткрыть файл и перемотать к концу.
         ВНИМАНИЕ: вызывать ТОЛЬКО под self._lock!
+        stderr уже перенаправлен в /dev/null
+        (в __init__), отдельное подавление не нужно.
         """
         if self._cap:
             self._cap.release()
-        # Подавляем FFmpeg warnings при переоткрытии
-        saved = self._suppress_ffmpeg_warnings()
         self._cap = cv2.VideoCapture(self.ts_path)
-        self._restore_stderr(saved)
         if self._cap.isOpened():
             total = int(
                 self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -320,6 +328,11 @@ class FileCapture:
                 self._cap.release()
                 self._cap = None
             self._opened = False
+        # Восстанавливаем stderr после завершения
+        self._restore_stderr_permanent(
+            self._saved_stderr_fd
+        )
+        self._saved_stderr_fd = None
 
 
 class SegmentRecorder:
@@ -477,24 +490,36 @@ class SegmentRecorder:
                     "ffmpeg",
                     "-y",
                     "-loglevel", "warning",
+                    # Генерировать корректные PTS.
+                    "-fflags", "+genpts",
+                    # Большой буфер для AVFoundation
+                    # — предотвращает потерю кадров
+                    # при пиковой нагрузке CPU.
+                    "-thread_queue_size", "1024",
                     "-f", "avfoundation",
                     "-framerate", str(self.usb_fps),
                     "-video_size", resolution,
                     "-i", ffmpeg_device,
                     "-c:v", "libx264",
-                    "-preset", "fast",
+                    # ultrafast — минимум CPU на
+                    # кодирование промежуточного .ts,
+                    # предотвращает frame drops.
+                    # Файл больше, но при извлечении
+                    # перекодируем в slow CRF 17.
+                    "-preset", "ultrafast",
                     "-g", "15",
                     "-bf", "0",
-                    "-crf", "16",
+                    "-crf", "18",
                     "-f", "mpegts",
                     self.direct_output_file
                 ]
                 self.logger.info(
-                    f"  Recording: {self.direct_output_file}"
+                    f"  Recording: "
+                    f"{self.direct_output_file}"
                 )
                 self.logger.info(
-                    "  Encoding: fast, CRF 16, "
-                    "keyframes every 0.5s (-g 15)"
+                    "  Encoding: ultrafast, CRF 18,"
+                    " keyframes every 0.5s (-g 15)"
                 )
                 self.logger.info(
                     "  Analysis: from .ts file (shared)"
@@ -903,11 +928,18 @@ class VideoMerger:
     def _build_vf_filter(
         crop_params: tuple = None,
         scale_size: str = None,
+        enhance: bool = False,
     ) -> str:
         """
         Построить FFmpeg -vf filter chain.
-        Порядок: crop → scale (сжатие после обрезки
-        для максимального качества).
+        Порядок: crop → enhance → scale
+        (сжатие после обрезки для макс. качества).
+
+        Args:
+            crop_params: (x, y, w, h) для обрезки
+            scale_size: "WxH" для масштабирования
+            enhance: добавить hqdn3d + unsharp
+                фильтры для улучшения качества
         
         Returns:
             Строка фильтра или "" если фильтров нет.
@@ -916,6 +948,17 @@ class VideoMerger:
         if crop_params:
             x, y, w, h = crop_params
             filters.append(f"crop={w}:{h}:{x}:{y}")
+        # Пост-обработка: шумоподавление + резкость
+        # hqdn3d — убирает шум от сжатия,
+        #   артефакты стекла и битые макроблоки.
+        #   4:4:3:3 — усиленный temporal denoising
+        #   для маскировки h264 artifacts.
+        # unsharp — компенсирует размытие стекла
+        if enhance:
+            filters.append("hqdn3d=4:4:3:3")
+            filters.append(
+                "unsharp=3:3:0.5:3:3:0.5"
+            )
         if scale_size and "x" in scale_size.lower():
             sw, sh = scale_size.lower().split("x")
             # -2 для чётности (требование H.264)
@@ -933,6 +976,7 @@ class VideoMerger:
         time_range: tuple,
         crop_params: tuple = None,
         scale_size: str = None,
+        enhance: bool = False,
     ) -> bool:
         """
         Извлечь сегмент из непрерывной .ts записи.
@@ -941,8 +985,8 @@ class VideoMerger:
            конкурентного чтения/записи и артефактов).
         2) Input seeking (-ss ДО -i) — FFmpeg
            перепрыгивает к ближайшему keyframe.
-        3) Crop → Scale → Encode (сжатие ПОСЛЕ
-           обрезки = максимум качества на пиксель).
+        3) Crop → Enhance → Scale → Encode (сжатие
+           ПОСЛЕ обрезки = максимум качества).
         """
         import shutil
         
@@ -971,9 +1015,10 @@ class VideoMerger:
             )
             temp_ts = input_file  # fallback
         
-        # Шаг 3: строим filter chain (crop → scale)
+        # Шаг 3: строим filter chain
+        # (crop → enhance → scale)
         vf = self._build_vf_filter(
-            crop_params, scale_size
+            crop_params, scale_size, enhance
         )
         if crop_params:
             x, y, w, h = crop_params
@@ -982,16 +1027,28 @@ class VideoMerger:
             )
         if scale_size:
             self.logger.info(f"Scale: {scale_size}")
+        if enhance:
+            self.logger.info(
+                "Enhance: hqdn3d + unsharp"
+            )
         
         # Шаг 4: input seeking + re-encode
         # -ss ДО -i = seek к ближайшему keyframe
         # С -g 15 (keyframe каждые 0.5с) точность
         # ±0.5с — достаточно.
+        # -fflags +discardcorrupt+genpts — отбросить
+        #   битые пакеты и сгенерировать PTS.
         # -err_detect ignore_err — пропустить
-        # повреждённые пакеты вместо артефактов.
+        #   оставшиеся ошибки без прерывания.
+        # -ec guess_mvs+deblock — error concealment:
+        #   вместо зелёных/серых блоков восстановить
+        #   битые макроблоки через предсказание
+        #   motion vectors + деблокинг.
         cmd = [
             "ffmpeg", "-y",
+            "-fflags", "+discardcorrupt+genpts",
             "-err_detect", "ignore_err",
+            "-ec", "guess_mvs+deblock",
             "-ss", str(max(0, start_sec)),
             "-i", temp_ts,
             "-t", str(duration_sec),
@@ -1068,7 +1125,8 @@ class VideoMerger:
         output_path: str,
         crop_params: tuple = None,
         time_range: tuple = None,
-        scale_size: str = None
+        scale_size: str = None,
+        enhance: bool = False,
     ) -> bool:
         """
         Объединить сегменты в один файл.
@@ -1079,7 +1137,8 @@ class VideoMerger:
             crop_params: (x, y, w, h) для обрезки
             time_range: (start_sec, duration_sec)
             scale_size: "WxH" для масштабирования
-                        после обрезки (например "1280x720")
+                после обрезки (например "1280x720")
+            enhance: hqdn3d + unsharp фильтры
         
         Returns:
             True если успешно
@@ -1115,6 +1174,7 @@ class VideoMerger:
                 time_range,
                 crop_params,
                 scale_size,
+                enhance,
             )
         
         
@@ -1128,22 +1188,27 @@ class VideoMerger:
                     escaped = abs_path.replace("'", "'\\''")
                     f.write(f"file '{escaped}'\n")
             
-            # Строим фильтр: crop → scale
+            # Строим фильтр: crop → enhance → scale
             vf = self._build_vf_filter(
-                crop_params, scale_size
+                crop_params, scale_size, enhance
             )
             
             if vf:
                 # С фильтрами — перекодируем
+                # -ec: error concealment для
+                # битых макроблоков
                 cmd = [
                     "ffmpeg", "-y",
+                    "-err_detect", "ignore_err",
+                    "-ec", "guess_mvs+deblock",
                     "-f", "concat", "-safe", "0",
                     "-i", list_file,
                     "-vf", vf,
                     "-c:v", "libx264",
                     "-preset", "medium",
                     "-crf", "18",
-                    "-c:a", "aac", "-b:a", "128k",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
                     output_path
                 ]
             else:
@@ -1335,6 +1400,7 @@ class MotionDetector:
         inference_server_port: int = DEFAULT_INFERENCE_SERVER_PORT,
         inference_jpeg_quality: int = DEFAULT_INFERENCE_JPEG_QUALITY,
         inference_timeout: float = DEFAULT_INFERENCE_TIMEOUT,
+        enhance_video: bool = False,
     ):
         self.rtmp_url = rtmp_url
         self.output_dir = output_dir
@@ -1362,6 +1428,9 @@ class MotionDetector:
         self.crop_height = crop_height
         self.crop_scale = crop_scale
         self.crop_pad = crop_pad
+        
+        # Пост-обработка видео (hqdn3d + unsharp)
+        self.enhance_video = enhance_video
         
         # USB режим
         self.input_source = input_source.lower()
@@ -1492,6 +1561,10 @@ class MotionDetector:
                     f"     Scale after crop: "
                     f"{self.crop_scale}"
                 )
+        if self.enhance_video:
+            self.logger.info(
+                "  🎨 ENHANCE: hqdn3d + unsharp"
+            )
         
         # Storage Manager для автоматической очистки
         self.storage_manager = None
@@ -1588,6 +1661,7 @@ class MotionDetector:
         # ML Bird Classifier
         self.bird_classifier = None
         self._best_frame = None
+        self._bg_frame = None  # фон (без птицы)
         self._best_motion_percent = 0.0
         self._last_classification = None
 
@@ -2114,6 +2188,7 @@ class MotionDetector:
             crop_params,
             time_range,
             scale_size,
+            self.enhance_video,
         ):
             # Проверяем что файл реально создался
             if not os.path.exists(temp_filepath):
@@ -2141,19 +2216,51 @@ class MotionDetector:
                         self.analytics.set_last_video(
                             final_filename
                         )
+
+                    # ML: если best_frame не нашёл
+                    # птицу — пробуем кадры из видео
+                    no_bird = (
+                        self._last_classification
+                        is None
+                        or not self
+                        ._last_classification
+                        .bird_detected
+                    )
+                    if no_bird:
+                        self._classify_from_video(
+                            final_filepath
+                        )
                     
-                    # Отправить видео в Telegram (если включено)
+                    # Отправить видео в Telegram
                     self._send_to_telegram_async(
                         final_filepath,
                         was_recording_type,
                         real_duration
                     )
                 except Exception as e:
-                    self.logger.error(f"Failed to rename: {e}")
-                    # Файл существует - просто используем temp имя
+                    self.logger.error(
+                        f"Failed to rename: {e}"
+                    )
                     if os.path.exists(temp_filepath):
-                        self.logger.info(f"■ {type_str} saved: {prefix}_{timestamp}_temp.mp4")
-                        # Отправить видео в Telegram
+                        self.logger.info(
+                            f"■ {type_str} saved: "
+                            f"{prefix}_{timestamp}"
+                            f"_temp.mp4"
+                        )
+                        # ML: retry из видео
+                        no_bird = (
+                            self
+                            ._last_classification
+                            is None
+                            or not self
+                            ._last_classification
+                            .bird_detected
+                        )
+                        if no_bird:
+                            self \
+                                ._classify_from_video(
+                                    temp_filepath
+                                )
                         self._send_to_telegram_async(
                             temp_filepath,
                             was_recording_type,
@@ -2353,13 +2460,29 @@ class MotionDetector:
             try:
                 from aiogram import Bot
                 from aiogram.types import FSInputFile
+                from aiogram.exceptions import (
+                    TelegramNetworkError,
+                )
 
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
                 async def _send():
+                    from aiogram.client.session \
+                        .aiohttp import AiohttpSession
+                    import aiohttp
+                    # Timeout 600с для загрузки
+                    # больших видео
+                    session = AiohttpSession(
+                        timeout=aiohttp.ClientTimeout(
+                            total=600,
+                            sock_connect=30,
+                            sock_read=600,
+                        )
+                    )
                     bot = Bot(
-                        token=notifier.bot_token
+                        token=notifier.bot_token,
+                        session=session,
                     )
                     try:
                         final_path = video_path
@@ -2367,6 +2490,10 @@ class MotionDetector:
                             os.path.getsize(
                                 video_path
                             ) / (1024**2)
+                        )
+                        logger.info(
+                            f"  📱 Video size: "
+                            f"{size_mb:.1f}MB"
                         )
 
                         if (
@@ -2396,20 +2523,68 @@ class MotionDetector:
                         video_file = FSInputFile(
                             final_path
                         )
-                        await bot.send_video(
-                            chat_id=(
-                                notifier.chat_id
-                            ),
-                            video=video_file,
-                            caption=(
-                                caption[:1024]
-                                if caption
-                                else None
-                            ),
-                            parse_mode="HTML",
-                            supports_streaming=True,
-                            reply_markup=keyboard,
-                        )
+
+                        # Retry с exponential backoff
+                        # при сетевых ошибках Telegram
+                        max_retries = 3
+                        for attempt in range(
+                            max_retries
+                        ):
+                            try:
+                                await bot.send_video(
+                                    chat_id=(
+                                        notifier
+                                        .chat_id
+                                    ),
+                                    video=video_file,
+                                    caption=(
+                                        caption[:1024]
+                                        if caption
+                                        else None
+                                    ),
+                                    parse_mode="HTML",
+                                    supports_streaming=(
+                                        True
+                                    ),
+                                    reply_markup=(
+                                        keyboard
+                                    ),
+                                    request_timeout=(
+                                        300
+                                    ),
+                                )
+                                break
+                            except (
+                                TelegramNetworkError
+                            ) as e:
+                                if (
+                                    attempt
+                                    < max_retries - 1
+                                ):
+                                    delay = (
+                                        10
+                                        * (2 ** attempt)
+                                    )
+                                    logger.warning(
+                                        f"  📱 Telegram "
+                                        f"retry "
+                                        f"{attempt + 1}"
+                                        f"/{max_retries}"
+                                        f" in {delay}s"
+                                        f": {e}"
+                                    )
+                                    await (
+                                        asyncio.sleep(
+                                            delay
+                                        )
+                                    )
+                                    video_file = (
+                                        FSInputFile(
+                                            final_path
+                                        )
+                                    )
+                                else:
+                                    raise
 
                         logger.info(
                             f"  📱 Sent to "
@@ -2445,11 +2620,81 @@ class MotionDetector:
                 loop.run_until_complete(_send())
                 loop.close()
             except Exception as e:
-                logger.error(f"Error sending to Telegram: {e}", exc_info=True)
+                logger.error(
+                    f"Error sending to "
+                    f"Telegram: {e}",
+                    exc_info=True,
+                )
         
         thread = Thread(target=send_video_thread, daemon=True)
         thread.start()
     
+    def _save_debug_frame(
+        self, frame, label, visit_id=0
+    ):
+        """
+        Сохранить кадр для отладки ML-детекции
+        в debug_ml/.
+        """
+        debug_dir = os.path.join(
+            self.output_dir, "..", "debug_ml"
+        )
+        os.makedirs(debug_dir, exist_ok=True)
+        ts = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        fname = (
+            f"v{visit_id}_{label}_{ts}.jpg"
+        )
+        path = os.path.join(debug_dir, fname)
+        try:
+            cv2.imwrite(path, frame)
+            self.logger.info(
+                f"  🖼️ Debug frame: {fname}"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"  Failed to save debug "
+                f"frame: {e}"
+            )
+
+    def _log_debug_detections(
+        self, frame, label="best_frame"
+    ):
+        """
+        Запустить detect_all_debug и вывести
+        ВСЕ обнаруженные объекты в лог (top-5).
+        """
+        if (
+            not self.bird_classifier
+            or not self.bird_classifier.detector
+        ):
+            return
+        try:
+            all_dets = (
+                self.bird_classifier.detector
+                .detect_all_debug(frame)
+            )
+            if all_dets:
+                items = [
+                    f"{d.class_name}={d.confidence:.2f}"
+                    for d in all_dets
+                ]
+                self.logger.info(
+                    f"  🔍 ML debug ({label}): "
+                    + ", ".join(items)
+                )
+            else:
+                self.logger.info(
+                    f"  🔍 ML debug ({label}): "
+                    f"nothing detected "
+                    f"(all < 0.1)"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"  ML debug error: {e}"
+            )
+
     def _run_classification(self):
         """
         Запустить ML-классификацию на лучшем кадре
@@ -2457,15 +2702,31 @@ class MotionDetector:
         self._last_classification.
         """
         try:
+            visit_id = self.stats.get(
+                'significant_motion_events', 0
+            )
+            # Debug: логируем ВСЕ обнаружения
+            self._log_debug_detections(
+                self._best_frame, "best_frame"
+            )
+            # Debug: сохраняем кадр
+            self._save_debug_frame(
+                self._best_frame,
+                "best_frame",
+                visit_id,
+            )
+
             # Передаём буфер кадров для behavior
             frame_buf = (
                 self._frame_buffer
                 if self._behavior_enabled
                 else None
             )
-            result = self.bird_classifier.process_frame(
-                self._best_frame,
-                frame_buffer=frame_buf,
+            result = (
+                self.bird_classifier.process_frame(
+                    self._best_frame,
+                    frame_buffer=frame_buf,
+                )
             )
             self._last_classification = result
 
@@ -2477,23 +2738,23 @@ class MotionDetector:
                 behavior_str = ""
                 if caption_info.get("behavior"):
                     behavior_str = (
-                        f" — {caption_info['behavior']}"
+                        f" — "
+                        f"{caption_info['behavior']}"
                         f" ({caption_info['behavior_confidence']:.0%})"
                     )
                 count_str = ""
                 if result.bird_count > 1:
                     count_str = (
-                        f" [{result.bird_count} птиц]"
+                        f" [{result.bird_count}"
+                        f" птиц]"
                     )
                 self.logger.info(
-                    f"  🧠 ML: {caption_info['name']}"
+                    f"  🧠 ML: "
+                    f"{caption_info['name']}"
                     f" ({caption_info['confidence']:.0%})"
                     f"{behavior_str}{count_str}"
                 )
                 # Сохраняем кроп для обучения
-                visit_id = self.stats.get(
-                    'significant_motion_events', 0
-                )
                 self.bird_classifier.save_crop(
                     self._best_frame,
                     result,
@@ -2515,15 +2776,341 @@ class MotionDetector:
                             .behavior_en
                         )
             else:
-                self.logger.info(
-                    "  🧠 ML: no bird detected "
-                    "in best frame"
+                # YOLO не нашёл → fallback:
+                # frame diff + CLIP
+                self._run_clip_fallback(
+                    visit_id
                 )
         except Exception as e:
             self.logger.error(
                 f"ML classification error: {e}",
                 exc_info=True,
             )
+
+    def _run_clip_fallback(self, visit_id=0):
+        """
+        Frame-diff + CLIP fallback для
+        _run_classification. Сравниваем фоновый
+        кадр с best_frame → находим область
+        птицы → CLIP классифицирует вид.
+        """
+        sc = getattr(
+            self.bird_classifier,
+            'species_classifier', None,
+        )
+        if (
+            self._bg_frame is None
+            or self._best_frame is None
+            or not sc or not sc.is_ready()
+        ):
+            self.logger.info(
+                "  🧠 ML: no bird detected "
+                "in best frame"
+            )
+            return
+
+        self.logger.info(
+            "  🧠 YOLO failed, trying "
+            "frame-diff + CLIP on best_frame..."
+        )
+        bbox = self._find_diff_bbox(
+            self._bg_frame, self._best_frame
+        )
+        if bbox is None:
+            self.logger.info(
+                "  🧠 ML: no diff region found"
+            )
+            return
+
+        x, y, w, h = bbox
+        self.logger.info(
+            f"  🔍 Diff region: "
+            f"{w}x{h} at ({x},{y})"
+        )
+        clip_res = sc.classify(
+            self._best_frame, bbox
+        )
+        if clip_res:
+            try:
+                from bird_classifier import (
+                    ClassificationResult,
+                )
+            except ImportError:
+                from detector.bird_classifier \
+                    import ClassificationResult
+            result = ClassificationResult()
+            result.bird_detected = True
+            result.bird_count = 1
+            result.species = clip_res
+            self._last_classification = result
+            self.logger.info(
+                f"  🧠 ML CLIP: "
+                f"{clip_res.species_ru}"
+                f" ({clip_res.confidence:.0%})"
+            )
+            if self.analytics:
+                self.analytics.set_species(
+                    clip_res.species_ru
+                )
+        else:
+            self.logger.info(
+                "  🧠 ML: CLIP no species "
+                "above threshold"
+            )
+
+    def _classify_from_video(self, video_path):
+        """
+        Извлечь кадры от начала движения в видео,
+        попробовать YOLO, затем fallback на
+        frame-diff + CLIP для обнаружения птицы.
+
+        Структура видео:
+          [pre_buffer 5s][движение][post_buffer 5s]
+
+        Алгоритм:
+        1. YOLO на 3 кадрах после начала движения
+        2. Если YOLO не нашёл → frame diff:
+           сравниваем кадр БЕЗ птицы (t=1с) и
+           С птицей → находим область изменений →
+           кропим → CLIP классифицирует вид.
+        """
+        if not self.bird_classifier:
+            return
+        if not os.path.exists(video_path):
+            return
+
+        vid = self.stats.get(
+            'significant_motion_events', 0
+        )
+
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                self.logger.warning(
+                    "  🧠 Cannot open video "
+                    "for classification"
+                )
+                return
+
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total = int(
+                cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            )
+            if total < 10:
+                cap.release()
+                return
+
+            pre_buf = self.buffer_seconds
+            motion_start = int(pre_buf * fps)
+            offsets = [
+                int(fps * 0.5),
+                int(fps * 1.0),
+                int(fps * 1.5),
+            ]
+
+            # --- Читаем «пустой» кадр (t=1с) ---
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                int(fps * 1),
+            )
+            ret_e, empty_frame = cap.read()
+            if not ret_e or empty_frame is None:
+                empty_frame = None
+
+            # --- Stage 1: YOLO на 3 кадрах ---
+            motion_frames = []
+            for i, offset in enumerate(offsets):
+                target = min(
+                    motion_start + offset,
+                    total - 1,
+                )
+                cap.set(
+                    cv2.CAP_PROP_POS_FRAMES,
+                    target,
+                )
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
+
+                motion_frames.append(
+                    (target, frame)
+                )
+                label = f"video_f{target}"
+                self._log_debug_detections(
+                    frame, label
+                )
+                self._save_debug_frame(
+                    frame, label, vid
+                )
+
+                result = (
+                    self.bird_classifier
+                    .process_frame(frame)
+                )
+                if result and result.bird_detected:
+                    self._last_classification = (
+                        result
+                    )
+                    info = (
+                        self.bird_classifier
+                        .get_caption_info(result)
+                    )
+                    self.logger.info(
+                        f"  🧠 ML YOLO (video "
+                        f"f#{target}): "
+                        f"{info['name']}"
+                        f" ({info['confidence']:.0%})"
+                    )
+                    self.bird_classifier.save_crop(
+                        frame, result,
+                        visit_id=vid,
+                    )
+                    if self.analytics:
+                        sp = (
+                            self.bird_classifier
+                            .get_species_name(result)
+                        )
+                        self.analytics.set_species(
+                            sp
+                        )
+                    cap.release()
+                    return
+
+            # --- Stage 2: frame diff + CLIP ---
+            sc = getattr(
+                self.bird_classifier,
+                'species_classifier', None,
+            )
+            if (
+                empty_frame is not None
+                and sc and sc.is_ready()
+                and motion_frames
+            ):
+                self.logger.info(
+                    "  🧠 YOLO failed, trying "
+                    "frame-diff + CLIP..."
+                )
+                for target, frame in motion_frames:
+                    bbox = self._find_diff_bbox(
+                        empty_frame, frame
+                    )
+                    if bbox is None:
+                        continue
+                    x, y, w, h = bbox
+                    self.logger.info(
+                        f"  🔍 Diff region: "
+                        f"{w}x{h} at ({x},{y})"
+                    )
+                    clip_res = sc.classify(
+                        frame, bbox
+                    )
+                    if clip_res:
+                        try:
+                            from bird_classifier \
+                                import (
+                                    ClassificationResult
+                                )
+                        except ImportError:
+                            from detector \
+                                .bird_classifier \
+                                import (
+                                    ClassificationResult
+                                )
+                        result = (
+                            ClassificationResult()
+                        )
+                        result.bird_detected = True
+                        result.bird_count = 1
+                        result.species = clip_res
+                        self._last_classification = (
+                            result
+                        )
+                        self.logger.info(
+                            f"  🧠 ML CLIP (video "
+                            f"f#{target}): "
+                            f"{clip_res.species_ru}"
+                            f" ({clip_res.confidence:.0%})"
+                        )
+                        if self.analytics:
+                            self.analytics \
+                                .set_species(
+                                    clip_res
+                                    .species_ru
+                                )
+                        cap.release()
+                        return
+
+            cap.release()
+            self.logger.info(
+                "  🧠 ML (video): no bird in "
+                "3 frames (YOLO+CLIP)"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"ML video classification "
+                f"error: {e}",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _find_diff_bbox(
+        empty_frame, bird_frame,
+        min_area=2000,
+    ):
+        """
+        Найти область максимальных изменений
+        между пустым кадром и кадром с птицей.
+
+        Returns:
+            (x, y, w, h) или None
+        """
+        diff = cv2.absdiff(
+            empty_frame, bird_frame
+        )
+        gray = cv2.cvtColor(
+            diff, cv2.COLOR_BGR2GRAY
+        )
+        _, thresh = cv2.threshold(
+            gray, 30, 255, cv2.THRESH_BINARY
+        )
+        # Морфология: убираем шум
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (9, 9)
+        )
+        thresh = cv2.morphologyEx(
+            thresh, cv2.MORPH_CLOSE, kernel
+        )
+        thresh = cv2.morphologyEx(
+            thresh, cv2.MORPH_OPEN, kernel
+        )
+
+        contours, _ = cv2.findContours(
+            thresh,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        if not contours:
+            return None
+
+        # Берём самый большой контур
+        largest = max(
+            contours, key=cv2.contourArea,
+        )
+        area = cv2.contourArea(largest)
+        if area < min_area:
+            return None
+
+        x, y, w, h = cv2.boundingRect(largest)
+
+        # Добавляем padding 30%
+        pad = int(max(w, h) * 0.3)
+        img_h, img_w = empty_frame.shape[:2]
+        x = max(0, x - pad)
+        y = max(0, y - pad)
+        w = min(img_w - x, w + 2 * pad)
+        h = min(img_h - y, h + 2 * pad)
+
+        return (x, y, w, h)
 
     def process_frame(self, frame: np.ndarray):
         """Обработка одного кадра."""
@@ -2604,7 +3191,10 @@ class MotionDetector:
                         self.start_recording(RecordingType.MOTION)
         else:
             self.consecutive_motion_frames = 0
-        
+            # Обновляем фон (для CLIP fallback)
+            if not self.significant_motion_started:
+                self._bg_frame = frame.copy()
+
         # Проверяем окончание движения
         if self.significant_motion_started:
             time_since_last_motion = current_time - self.last_motion_time
@@ -3040,6 +3630,12 @@ def main():
     crop_scale = config.get("CROP_SCALE", "").strip()
     crop_pad = int(config.get("CROP_PAD", "0"))
     
+    # Пост-обработка видео (hqdn3d + unsharp)
+    enhance_video = (
+        config.get("ENHANCE_VIDEO", "false")
+        .lower() == "true"
+    )
+    
     # USB параметры
     input_source = config.get("INPUT_SOURCE", "rtmp").lower()
     usb_device = config.get("USB_DEVICE", "/dev/video0")
@@ -3204,6 +3800,7 @@ def main():
         inference_server_port=inference_server_port,
         inference_jpeg_quality=inference_jpeg_quality,
         inference_timeout=inference_timeout,
+        enhance_video=enhance_video,
     )
     
     def signal_handler(sig, frame):

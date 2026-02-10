@@ -446,6 +446,191 @@ class BirdDetector:
 
         return detections
 
+    def detect_tiled(
+        self, frame: np.ndarray,
+    ) -> List[Detection]:
+        """
+        Тайловая детекция: разбить кадр на
+        2 горизонтальных тайла с перекрытием
+        и запустить YOLO на каждом.
+
+        Объекты в тайле ~2x крупнее → лучше
+        детекция мелких птиц через стекло.
+
+        Используется как fallback когда обычный
+        detect() ничего не нашёл.
+        """
+        if self.session is None:
+            return []
+
+        img_h, img_w = frame.shape[:2]
+        if img_w < 640:
+            return self.detect(frame)
+
+        # 2 тайла с 10% перекрытием
+        overlap = int(img_w * 0.1)
+        tile_w = img_w // 2 + overlap
+
+        tiles = [
+            (0, 0, tile_w, img_h),
+            (img_w - tile_w, 0, tile_w, img_h),
+        ]
+
+        all_dets = []
+        for tx, ty, tw, th in tiles:
+            crop = frame[ty:ty+th, tx:tx+tw]
+            dets = self.detect(crop)
+            # Корректируем координаты
+            # к оригинальному кадру
+            for d in dets:
+                d.x += tx
+                d.y += ty
+            all_dets.extend(dets)
+
+        # Простой NMS для дедупликации
+        # (перекрытие может дать дубли)
+        if len(all_dets) > 1:
+            all_dets = self._nms_dedup(all_dets)
+
+        return all_dets
+
+    @staticmethod
+    def _nms_dedup(
+        dets: List[Detection],
+        iou_thresh: float = 0.3,
+    ) -> List[Detection]:
+        """Убрать дубликаты детекций из тайлов."""
+        if len(dets) <= 1:
+            return dets
+        # Сортировка по confidence
+        dets.sort(
+            key=lambda d: d.confidence,
+            reverse=True,
+        )
+        keep = []
+        for d in dets:
+            is_dup = False
+            for k in keep:
+                # IoU
+                x1 = max(d.x, k.x)
+                y1 = max(d.y, k.y)
+                x2 = min(
+                    d.x + d.width,
+                    k.x + k.width,
+                )
+                y2 = min(
+                    d.y + d.height,
+                    k.y + k.height,
+                )
+                inter = max(0, x2 - x1) * max(
+                    0, y2 - y1
+                )
+                area_d = d.width * d.height
+                area_k = k.width * k.height
+                union = area_d + area_k - inter
+                if union > 0:
+                    iou = inter / union
+                    if iou > iou_thresh:
+                        is_dup = True
+                        break
+            if not is_dup:
+                keep.append(d)
+        return keep
+
+    def detect_all_debug(
+        self, frame: np.ndarray,
+        min_score: float = 0.1,
+        top_k: int = 5,
+    ) -> List[Detection]:
+        """
+        Детекция ВСЕХ объектов (не только птиц)
+        с низким порогом для отладки.
+
+        Возвращает top_k обнаружений с макс.
+        confidence (любые COCO классы).
+        """
+        if self.session is None:
+            return []
+
+        img_h, img_w = frame.shape[:2]
+
+        img_rgb = cv2.cvtColor(
+            frame, cv2.COLOR_BGR2RGB
+        )
+        img_resized, pad = self._letterbox(
+            img_rgb,
+            (self.input_height, self.input_width),
+        )
+        img_data = (
+            np.array(img_resized, dtype=np.float32)
+            / 255.0
+        )
+        img_data = np.transpose(
+            img_data, (2, 0, 1)
+        )
+        img_data = img_data[np.newaxis, ...]
+
+        model_inputs = self.session.get_inputs()
+        outputs = self.session.run(
+            None,
+            {model_inputs[0].name: img_data},
+        )
+
+        output = np.transpose(
+            np.squeeze(outputs[0])
+        )
+        rows = output.shape[0]
+
+        gain = min(
+            self.input_height / img_h,
+            self.input_width / img_w,
+        )
+
+        all_dets = []
+        for i in range(rows):
+            classes_scores = output[i][4:]
+            max_score = float(
+                np.amax(classes_scores)
+            )
+            if max_score < min_score:
+                continue
+            class_id = int(
+                np.argmax(classes_scores)
+            )
+
+            x = output[i][0] - pad[1]
+            y = output[i][1] - pad[0]
+            w = output[i][2]
+            h = output[i][3]
+            left = int((x - w / 2) / gain)
+            top = int((y - h / 2) / gain)
+            width = int(w / gain)
+            height = int(h / gain)
+            left = max(0, left)
+            top = max(0, top)
+            width = min(width, img_w - left)
+            height = min(height, img_h - top)
+
+            if width > 0 and height > 0:
+                all_dets.append(Detection(
+                    class_id=class_id,
+                    class_name=COCO_CLASSES[
+                        class_id
+                    ],
+                    confidence=max_score,
+                    x=left,
+                    y=top,
+                    width=width,
+                    height=height,
+                ))
+
+        # Сортируем по confidence, берём top_k
+        all_dets.sort(
+            key=lambda d: d.confidence,
+            reverse=True,
+        )
+        return all_dets[:top_k]
+
 
 class SpeciesClassifier:
     """
@@ -570,10 +755,33 @@ class SpeciesClassifier:
                 )
                 if p in providers
             ]
-            self.session = ort.InferenceSession(
-                clip_path,
-                providers=preferred or providers,
+            used_provider = (
+                preferred[0] if preferred else "auto"
             )
+            try:
+                self.session = ort.InferenceSession(
+                    clip_path,
+                    providers=(
+                        preferred or providers
+                    ),
+                )
+            except Exception as coreml_err:
+                # CoreML может не поддерживать
+                # CLIP ViT-B/32 — fallback на CPU
+                self.logger.warning(
+                    f"  CLIP: {preferred[0] if preferred else 'auto'}"
+                    f" failed ({coreml_err}), "
+                    f"fallback to CPU"
+                )
+                self.session = ort.InferenceSession(
+                    clip_path,
+                    providers=[
+                        "CPUExecutionProvider"
+                    ],
+                )
+                used_provider = (
+                    "CPUExecutionProvider"
+                )
 
             size_mb = (
                 os.path.getsize(clip_path)
@@ -583,8 +791,7 @@ class SpeciesClassifier:
                 f"  🔬 CLIP visual loaded: "
                 f"{self.CLIP_VISUAL_FILENAME}"
                 f" ({size_mb:.0f} MB), "
-                f"provider="
-                f"{preferred[0] if preferred else 'auto'}"
+                f"provider={used_provider}"
             )
         except Exception as e:
             self.logger.error(
@@ -678,6 +885,101 @@ class SpeciesClassifier:
             and self.head_weight is not None
             and len(self.labels) > 0
         )
+
+    def detect_bird_clip(
+        self,
+        frame: np.ndarray,
+        threshold: float = 0.35,
+    ) -> Optional[SpeciesResult]:
+        """
+        CLIP-based обнаружение птицы на кадре.
+        Сканирует 3 региона: левая половина,
+        правая половина, центр.
+
+        Fallback для случая когда YOLO ничего
+        не нашёл. Работает потому что CLIP
+        на кропах даёт >0.5 для верного вида
+        и <0.25 для пустых кадров.
+
+        Returns:
+            SpeciesResult если птица найдена,
+            None если нет.
+        """
+        if not self.is_ready():
+            return None
+
+        img_h, img_w = frame.shape[:2]
+        if img_w < 200 or img_h < 200:
+            return None
+
+        cx = img_w // 2
+        qw = img_w // 4
+        # 3 региона: лево, право, центр
+        regions = [
+            (0, 0, cx + qw, img_h),
+            (cx - qw, 0, img_w, img_h),
+            (qw, 0, img_w - qw, img_h),
+        ]
+
+        best_result = None
+        best_conf = 0.0
+
+        for x1, y1, x2, y2 in regions:
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            try:
+                img_data = (
+                    self._preprocess_clip(crop)
+                )
+                inp = self.session.get_inputs()
+                out = self.session.run(
+                    None,
+                    {inp[0].name: img_data},
+                )
+                emb = out[0]
+                norm = np.linalg.norm(
+                    emb, axis=-1, keepdims=True
+                )
+                if norm > 0:
+                    emb = emb / norm
+                logits = (
+                    emb @ self.head_weight.T
+                    + self.head_bias
+                )
+                shifted = logits - np.max(
+                    logits, axis=-1,
+                    keepdims=True,
+                )
+                exp_l = np.exp(shifted)
+                probs = exp_l / exp_l.sum(
+                    axis=-1, keepdims=True,
+                )
+                ci = int(np.argmax(probs[0]))
+                conf = float(probs[0, ci])
+
+                if conf > best_conf:
+                    best_conf = conf
+                    if conf >= threshold:
+                        label = self.labels.get(
+                            str(ci), {}
+                        )
+                        best_result = SpeciesResult(
+                            species_ru=label.get(
+                                "ru",
+                                f"cls_{ci}",
+                            ),
+                            species_en=label.get(
+                                "en",
+                                f"cls_{ci}",
+                            ),
+                            confidence=conf,
+                            class_index=ci,
+                        )
+            except Exception:
+                continue
+
+        return best_result
 
     def classify(
         self,
@@ -1297,6 +1599,13 @@ class BirdClassifier:
 
         # Stage 1: детекция птиц
         detections = self.detector.detect(frame)
+
+        # Fallback: тайловая детекция если обычная
+        # не нашла (птица мелкая → тайлы помогают)
+        if not detections:
+            detections = (
+                self.detector.detect_tiled(frame)
+            )
 
         if not detections:
             return result
