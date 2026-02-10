@@ -444,6 +444,34 @@ class SegmentRecorder:
             self.logger.warning(f"Error cleaning segments dir: {e}")
             os.makedirs(self.segments_dir, exist_ok=True)
     
+    @staticmethod
+    def _check_videotoolbox():
+        """
+        Проверить доступность h264_videotoolbox
+        (аппаратный энкодер Apple Silicon).
+        Кэшируем результат.
+        """
+        if hasattr(
+            SegmentRecorder, '_hw_available'
+        ):
+            return SegmentRecorder._hw_available
+        try:
+            r = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner",
+                    "-encoders",
+                ],
+                capture_output=True,
+                timeout=5,
+            )
+            out = r.stdout.decode()
+            avail = "h264_videotoolbox" in out
+            SegmentRecorder._hw_available = avail
+            return avail
+        except Exception:
+            SegmentRecorder._hw_available = False
+            return False
+
     def _start_ffmpeg(self):
         """Внутренний метод запуска FFmpeg процесса."""
         segment_pattern = os.path.join(self.segments_dir, "seg_%Y%m%d_%H%M%S.ts")
@@ -486,40 +514,72 @@ class SegmentRecorder:
                 )
                 self.recording_start_time = time.time()
                 
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-loglevel", "warning",
-                    # Генерировать корректные PTS.
-                    "-fflags", "+genpts",
-                    # Большой буфер для AVFoundation
-                    # — предотвращает потерю кадров
-                    # при пиковой нагрузке CPU.
-                    "-thread_queue_size", "1024",
-                    "-f", "avfoundation",
-                    "-framerate", str(self.usb_fps),
-                    "-video_size", resolution,
-                    "-i", ffmpeg_device,
-                    "-c:v", "libx264",
-                    # ultrafast — минимум CPU на
-                    # кодирование промежуточного .ts,
-                    # предотвращает frame drops.
-                    # Файл больше, но при извлечении
-                    # перекодируем в slow CRF 17.
-                    "-preset", "ultrafast",
-                    "-g", "15",
-                    "-bf", "0",
-                    "-crf", "18",
-                    "-f", "mpegts",
-                    self.direct_output_file
-                ]
+                # Пробуем h264_videotoolbox
+                # (аппаратный энкодер Apple Silicon).
+                # Нулевая нагрузка CPU → нет frame
+                # drops → нет corruption.
+                # Fallback: libx264 ultrafast.
+                use_hw = self._check_videotoolbox()
+                if use_hw:
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-loglevel", "warning",
+                        "-fflags", "+genpts",
+                        "-thread_queue_size", "1024",
+                        "-f", "avfoundation",
+                        "-framerate",
+                        str(self.usb_fps),
+                        "-video_size", resolution,
+                        "-i", ffmpeg_device,
+                        "-c:v",
+                        "h264_videotoolbox",
+                        # Высокий битрейт для
+                        # промежуточного .ts —
+                        # перекодируем позже.
+                        "-b:v", "12M",
+                        # Keyframe каждые 0.5с
+                        "-g", "15",
+                        "-bf", "0",
+                        "-profile:v", "high",
+                        "-level:v", "4.1",
+                        "-realtime", "1",
+                        "-f", "mpegts",
+                        self.direct_output_file
+                    ]
+                    enc_label = (
+                        "h264_videotoolbox 12Mbps"
+                    )
+                else:
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-loglevel", "warning",
+                        "-fflags", "+genpts",
+                        "-thread_queue_size", "1024",
+                        "-f", "avfoundation",
+                        "-framerate",
+                        str(self.usb_fps),
+                        "-video_size", resolution,
+                        "-i", ffmpeg_device,
+                        "-c:v", "libx264",
+                        "-preset", "ultrafast",
+                        "-g", "15",
+                        "-bf", "0",
+                        "-crf", "18",
+                        "-f", "mpegts",
+                        self.direct_output_file
+                    ]
+                    enc_label = (
+                        "libx264 ultrafast CRF 18"
+                    )
                 self.logger.info(
                     f"  Recording: "
                     f"{self.direct_output_file}"
                 )
                 self.logger.info(
-                    "  Encoding: ultrafast, CRF 18,"
-                    " keyframes every 0.5s (-g 15)"
+                    f"  Encoding: {enc_label},"
+                    f" keyframes every 0.5s (-g 15)"
                 )
                 self.logger.info(
                     "  Analysis: from .ts file (shared)"
@@ -1032,25 +1092,36 @@ class VideoMerger:
                 "Enhance: hqdn3d + unsharp"
             )
         
-        # Шаг 4: input seeking + re-encode
-        # -ss ДО -i = seek к ближайшему keyframe
-        # С -g 15 (keyframe каждые 0.5с) точность
-        # ±0.5с — достаточно.
-        # -fflags +discardcorrupt+genpts — отбросить
-        #   битые пакеты и сгенерировать PTS.
-        # -err_detect ignore_err — пропустить
-        #   оставшиеся ошибки без прерывания.
-        # -ec guess_mvs+deblock — error concealment:
-        #   вместо зелёных/серых блоков восстановить
-        #   битые макроблоки через предсказание
-        #   motion vectors + деблокинг.
+        # Шаг 4: двойной seeking + re-encode
+        #
+        # Проблема: input seeking (-ss до -i)
+        # прыгает к ближайшему keyframe, но если
+        # keyframe повреждён — ВСЕ P-фреймы до
+        # следующего keyframe будут с артефактами.
+        #
+        # Решение: "двойной seeking":
+        # 1. Input seeking на 3с РАНЬШЕ цели
+        #    (гарантирует декодирование с чистого
+        #    keyframe ДО нашего сегмента)
+        # 2. Output seeking (-ss ПОСЛЕ -i) на 3с
+        #    (отбрасывает лишнее, точно по кадрам)
+        #
+        # Итого: декодер разогревается на 3с
+        # «чистых» данных, и к моменту нашего
+        # сегмента все reference frames корректны.
+        safety_margin = 3.0
+        input_ss = max(
+            0, start_sec - safety_margin
+        )
+        output_ss = start_sec - input_ss
         cmd = [
             "ffmpeg", "-y",
             "-fflags", "+discardcorrupt+genpts",
             "-err_detect", "ignore_err",
             "-ec", "guess_mvs+deblock",
-            "-ss", str(max(0, start_sec)),
+            "-ss", str(input_ss),
             "-i", temp_ts,
+            "-ss", str(output_ss),
             "-t", str(duration_sec),
         ]
         
