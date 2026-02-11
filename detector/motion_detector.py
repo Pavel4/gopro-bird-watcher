@@ -155,6 +155,7 @@ DEFAULT_ML_CONFIDENCE = 0.5
 DEFAULT_ML_SPECIES_ENABLED = False
 DEFAULT_ML_SAVE_CROPS = True
 DEFAULT_ML_CROPS_DIR = "./crops"
+DEFAULT_ML_DEBUG_ENABLED = True
 
 # ML распознавание поведения (TSM-MobileNetV3)
 DEFAULT_ML_BEHAVIOR_ENABLED = False
@@ -1126,78 +1127,83 @@ class VideoMerger:
         # === Debug: промежуточные этапы ===
         # Сохраняем в debug_video/ для анализа
         # на каком этапе появляются артефакты.
-        debug_dir = os.path.join(
-            os.path.dirname(output_path),
-            "..", "debug_video",
-        )
-        os.makedirs(debug_dir, exist_ok=True)
-        ts_stamp = datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
+        # Управляется флагом ml_debug_enabled.
+        if self.ml_debug_enabled:
+            debug_dir = os.path.join(
+                os.path.dirname(output_path),
+                "..", "debug_video",
+            )
+            os.makedirs(
+                debug_dir, exist_ok=True
+            )
+            ts_stamp = datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
 
-        # Этап A: сырой фрагмент .ts → mp4
-        # (stream copy, без перекодирования)
-        debug_raw = os.path.join(
-            debug_dir,
-            f"A_raw_{ts_stamp}.mp4",
-        )
-        cmd_raw = [
-            "ffmpeg", "-y",
-            "-fflags", "+genpts",
-            "-ss", str(input_ss),
-            "-i", temp_ts,
-            "-ss", str(output_ss),
-            "-t", str(duration_sec),
-            "-c", "copy",
-            "-an",
-            debug_raw,
-        ]
-        try:
-            subprocess.run(
-                cmd_raw,
-                capture_output=True,
-                timeout=60,
+            # Этап A: сырой фрагмент .ts → mp4
+            # (stream copy, без перекодирования)
+            debug_raw = os.path.join(
+                debug_dir,
+                f"A_raw_{ts_stamp}.mp4",
             )
-            self.logger.info(
-                f"  📼 Debug A (raw copy): "
-                f"{os.path.basename(debug_raw)}"
-            )
-        except Exception:
-            pass
+            cmd_raw = [
+                "ffmpeg", "-y",
+                "-fflags", "+genpts",
+                "-ss", str(input_ss),
+                "-i", temp_ts,
+                "-ss", str(output_ss),
+                "-t", str(duration_sec),
+                "-c", "copy",
+                "-an",
+                debug_raw,
+            ]
+            try:
+                subprocess.run(
+                    cmd_raw,
+                    capture_output=True,
+                    timeout=60,
+                )
+                self.logger.info(
+                    f"  📼 Debug A (raw copy)"
+                    f": {os.path.basename(debug_raw)}"
+                )
+            except Exception:
+                pass
 
-        # Этап B: декодирование + кодирование
-        # БЕЗ фильтров (только re-encode)
-        debug_nofilter = os.path.join(
-            debug_dir,
-            f"B_nofilter_{ts_stamp}.mp4",
-        )
-        cmd_nf = [
-            "ffmpeg", "-y",
-            "-fflags", "+discardcorrupt+genpts",
-            "-err_detect", "ignore_err",
-            "-ec", "guess_mvs+deblock",
-            "-ss", str(input_ss),
-            "-i", temp_ts,
-            "-ss", str(output_ss),
-            "-t", str(duration_sec),
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "17",
-            "-an",
-            debug_nofilter,
-        ]
-        try:
-            subprocess.run(
-                cmd_nf,
-                capture_output=True,
-                timeout=120,
+            # Этап B: декодирование + кодирование
+            # БЕЗ фильтров (только re-encode)
+            debug_nofilter = os.path.join(
+                debug_dir,
+                f"B_nofilter_{ts_stamp}.mp4",
             )
-            self.logger.info(
-                f"  📼 Debug B (no filter): "
-                f"{os.path.basename(debug_nofilter)}"
-            )
-        except Exception:
-            pass
+            cmd_nf = [
+                "ffmpeg", "-y",
+                "-fflags",
+                "+discardcorrupt+genpts",
+                "-err_detect", "ignore_err",
+                "-ec", "guess_mvs+deblock",
+                "-ss", str(input_ss),
+                "-i", temp_ts,
+                "-ss", str(output_ss),
+                "-t", str(duration_sec),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "17",
+                "-an",
+                debug_nofilter,
+            ]
+            try:
+                subprocess.run(
+                    cmd_nf,
+                    capture_output=True,
+                    timeout=120,
+                )
+                self.logger.info(
+                    f"  📼 Debug B (no filter)"
+                    f": {os.path.basename(debug_nofilter)}"
+                )
+            except Exception:
+                pass
 
         # === Этап C: финальный (с фильтрами) ===
         cmd = [
@@ -1544,6 +1550,7 @@ class MotionDetector:
         ml_species_enabled: bool = DEFAULT_ML_SPECIES_ENABLED,
         ml_save_crops: bool = DEFAULT_ML_SAVE_CROPS,
         ml_crops_dir: str = DEFAULT_ML_CROPS_DIR,
+        ml_debug_enabled: bool = DEFAULT_ML_DEBUG_ENABLED,
         ml_behavior_enabled: bool = DEFAULT_ML_BEHAVIOR_ENABLED,
         ml_behavior_num_frames: int = DEFAULT_ML_BEHAVIOR_NUM_FRAMES,
         ml_behavior_confidence: float = DEFAULT_ML_BEHAVIOR_CONFIDENCE,
@@ -1584,6 +1591,8 @@ class MotionDetector:
         
         # Пост-обработка видео (hqdn3d + unsharp)
         self.enhance_video = enhance_video
+        # Debug ML (сохранение кадров, кропов)
+        self.ml_debug_enabled = ml_debug_enabled
         
         # USB режим
         self.input_source = input_source.lower()
@@ -2856,11 +2865,15 @@ class MotionDetector:
         video_name = os.path.splitext(
             os.path.basename(video_path)
         )[0]
-        debug_dir = os.path.join(
-            self.output_dir, "..", "debug_ml",
-            video_name,
-        )
-        os.makedirs(debug_dir, exist_ok=True)
+        debug_dir = None
+        if self.ml_debug_enabled:
+            debug_dir = os.path.join(
+                self.output_dir, "..",
+                "debug_ml", video_name,
+            )
+            os.makedirs(
+                debug_dir, exist_ok=True
+            )
 
         try:
             cap = cv2.VideoCapture(video_path)
@@ -2880,19 +2893,50 @@ class MotionDetector:
                 return
 
             pre_buf = self.buffer_seconds
-            motion_start = int(pre_buf * fps)
+            duration_sec = total / fps
+
+            # Определяем начало движения.
+            # Если видео короче pre_buf →
+            # pre-buffer отсутствует (macOS)
+            # → движение с кадра 0.
+            if duration_sec > pre_buf + 1.0:
+                motion_start = int(
+                    pre_buf * fps
+                )
+            else:
+                motion_start = 0
+                self.logger.debug(
+                    "  🧠 Video shorter than "
+                    f"buffer ({duration_sec:.1f}"
+                    f"s < {pre_buf}s+1s), "
+                    "assuming no pre-buffer"
+                )
 
             # 5 точек после начала движения
-            time_offsets = [0.3, 0.8, 1.5, 2.5, 4.0]
+            time_offsets = [
+                0.3, 0.8, 1.5, 2.5, 4.0,
+            ]
 
-            # --- Фоновый кадр (t=1с) ---
-            cap.set(
-                cv2.CAP_PROP_POS_FRAMES,
-                int(fps * 1),
-            )
-            ret_bg, bg_frame = cap.read()
-            if not ret_bg or bg_frame is None:
-                # Fallback: используем _bg_frame
+            # --- Фоновый кадр ---
+            # Берём кадр из первых секунд
+            # (пустая кормушка до движения).
+            # Если motion_start=0, берём
+            # fallback из _bg_frame.
+            bg_frame = None
+            if motion_start > 0:
+                bg_pos = min(
+                    int(fps * 1), motion_start - 1
+                )
+                cap.set(
+                    cv2.CAP_PROP_POS_FRAMES,
+                    bg_pos,
+                )
+                ret_bg, bg_frame = cap.read()
+                if not ret_bg:
+                    bg_frame = None
+
+            # Fallback: используем _bg_frame
+            if bg_frame is None:
                 bg_frame = self._bg_frame
             if bg_frame is None:
                 cap.release()
@@ -2902,10 +2946,11 @@ class MotionDetector:
                 return
 
             # Сохраняем фон в debug
-            self._save_debug_frame(
-                bg_frame, "bg_frame.jpg",
-                debug_dir,
-            )
+            if debug_dir:
+                self._save_debug_frame(
+                    bg_frame, "bg_frame.jpg",
+                    debug_dir,
+                )
 
             # --- Извлекаем кадры и классифицируем ---
             votes = {}  # species_en → [confidences]
@@ -2938,13 +2983,16 @@ class MotionDetector:
                         f"({t_off}s): no diff"
                     )
                     # Сохраняем кадр без bbox
-                    fname = (
-                        f"frame_{i+1:02d}"
-                        f"_{t_off}s_no_diff.jpg"
-                    )
-                    self._save_debug_frame(
-                        frame, fname, debug_dir,
-                    )
+                    if debug_dir:
+                        fname = (
+                            f"frame_{i+1:02d}"
+                            f"_{t_off}s"
+                            f"_no_diff.jpg"
+                        )
+                        self._save_debug_frame(
+                            frame, fname,
+                            debug_dir,
+                        )
                     frame_results.append({
                         "offset": t_off,
                         "species": None,
@@ -2969,8 +3017,7 @@ class MotionDetector:
                 # Классификация
                 species_res = (
                     self.bird_classifier
-                    .vogel_classifier
-                    .classify(crop)
+                    .classify_crop(crop)
                 )
 
                 sp_name = "none"
@@ -2996,16 +3043,20 @@ class MotionDetector:
                 })
 
                 # Debug: сохраняем кроп
-                sp_label = sp_en.replace(" ", "_")
-                fname = (
-                    f"frame_{i+1:02d}"
-                    f"_{t_off}s"
-                    f"_{sp_label}"
-                    f"_{int(conf*100)}pct.jpg"
-                )
-                self._save_debug_frame(
-                    crop, fname, debug_dir,
-                )
+                if debug_dir:
+                    sp_label = sp_en.replace(
+                        " ", "_"
+                    )
+                    fname = (
+                        f"frame_{i+1:02d}"
+                        f"_{t_off}s"
+                        f"_{sp_label}"
+                        f"_{int(conf*100)}"
+                        f"pct.jpg"
+                    )
+                    self._save_debug_frame(
+                        crop, fname, debug_dir,
+                    )
 
                 self.logger.info(
                     f"  🐦 Frame {i+1} "
@@ -3021,10 +3072,12 @@ class MotionDetector:
                     "  🧠 ML: no species detected "
                     "in any frame"
                 )
-                self._write_debug_result(
-                    debug_dir, frame_results,
-                    None, 0, 0, len(time_offsets),
-                )
+                if debug_dir:
+                    self._write_debug_result(
+                        debug_dir, frame_results,
+                        None, 0, 0,
+                        len(time_offsets),
+                    )
                 return
 
             # Находим вид с макс. голосами
@@ -3058,19 +3111,24 @@ class MotionDetector:
                     f" or avg={avg_conf:.0%}"
                     f"<{min_avg_conf:.0%})"
                 )
-                self._write_debug_result(
-                    debug_dir, frame_results,
-                    best_species_en,
-                    n_votes, avg_conf,
-                    len(time_offsets),
-                )
+                if debug_dir:
+                    self._write_debug_result(
+                        debug_dir,
+                        frame_results,
+                        best_species_en,
+                        n_votes, avg_conf,
+                        len(time_offsets),
+                    )
                 return
 
             # Находим русское название
-            labels = getattr(
-                self.bird_classifier
-                .vogel_classifier,
-                'labels', {},
+            vc = getattr(
+                self.bird_classifier,
+                'vogel_classifier', None,
+            )
+            labels = (
+                getattr(vc, 'labels', {})
+                if vc else {}
             )
             species_ru = best_species_en
             for lbl in labels.values():
@@ -3110,12 +3168,14 @@ class MotionDetector:
                 )
 
             # Debug result
-            self._write_debug_result(
-                debug_dir, frame_results,
-                best_species_en,
-                n_votes, avg_conf,
-                len(time_offsets),
-            )
+            if debug_dir:
+                self._write_debug_result(
+                    debug_dir,
+                    frame_results,
+                    best_species_en,
+                    n_votes, avg_conf,
+                    len(time_offsets),
+                )
 
         except Exception as e:
             self.logger.error(
@@ -3610,6 +3670,9 @@ def load_config(config_path: str = None) -> dict:
             DEFAULT_ML_SAVE_CROPS
         ).lower(),
         "ML_CROPS_DIR": DEFAULT_ML_CROPS_DIR,
+        "ML_DEBUG_ENABLED": str(
+            DEFAULT_ML_DEBUG_ENABLED
+        ).lower(),
         "ML_BEHAVIOR_ENABLED": str(
             DEFAULT_ML_BEHAVIOR_ENABLED
         ).lower(),
@@ -3820,6 +3883,9 @@ def main():
     ml_crops_dir = config.get(
         "ML_CROPS_DIR", "./crops"
     )
+    ml_debug_enabled = config.get(
+        "ML_DEBUG_ENABLED", "true"
+    ).lower() == "true"
 
     # ML Behavior параметры
     ml_behavior_enabled = config.get(
@@ -3899,6 +3965,7 @@ def main():
         ml_species_enabled=ml_species_enabled,
         ml_save_crops=ml_save_crops,
         ml_crops_dir=ml_crops_dir,
+        ml_debug_enabled=ml_debug_enabled,
         ml_behavior_enabled=ml_behavior_enabled,
         ml_behavior_num_frames=ml_behavior_num_frames,
         ml_behavior_confidence=ml_behavior_confidence,

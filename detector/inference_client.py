@@ -320,6 +320,21 @@ class RemoteBirdClassifier:
 
         return result
 
+    def classify_crop(
+        self, crop: np.ndarray,
+    ):
+        """
+        Классифицировать один кроп в remote
+        режиме. Отправляем кроп как полный
+        кадр через process_frame.
+        """
+        if not self.is_available():
+            return None
+        result = self.process_frame(crop)
+        if result and result.species:
+            return result.species
+        return None
+
     def save_crop(
         self,
         frame: np.ndarray,
