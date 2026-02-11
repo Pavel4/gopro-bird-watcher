@@ -298,6 +298,7 @@ class TelegramNotifier:
         """
         behaviors = [
             ("🍽 Кормление", "feeding"),
+            ("🥡 Схватил", "grab_fly"),
             ("🪹 Сидение", "perching"),
             ("👀 Озирание", "alert"),
             ("⚔️ Драка", "fighting"),
@@ -568,6 +569,7 @@ class TelegramNotifier:
 
             behavior_names = {
                 "feeding": "Кормление",
+                "grab_fly": "Схватил и улетел",
                 "perching": "Сидение",
                 "alert": "Озирание",
                 "fighting": "Драка",

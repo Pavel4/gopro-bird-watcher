@@ -18,6 +18,7 @@ venv/
 # Recordings (keep folder structure via .gitkeep)
 recordings/motion/*.mp4
 recordings/manual/*.mp4
+recordings/debug_video/*.mp4
 recordings/.segments/
 recordings/.recording/
 

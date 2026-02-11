@@ -93,14 +93,18 @@ class SpeciesResult:
 
 # === Поведение птиц ===
 
-# 6 классов поведения для кормушки
+# 7 классов поведения для кормушки
 BEHAVIOR_CLASSES = {
     0: {"ru": "Кормление", "en": "feeding"},
-    1: {"ru": "Сидение", "en": "perching"},
-    2: {"ru": "Озирание", "en": "alert"},
-    3: {"ru": "Драка", "en": "fighting"},
-    4: {"ru": "Прилёт", "en": "arrival"},
-    5: {"ru": "Улёт", "en": "departure"},
+    1: {
+        "ru": "Схватил и улетел",
+        "en": "grab_fly",
+    },
+    2: {"ru": "Сидение", "en": "perching"},
+    3: {"ru": "Озирание", "en": "alert"},
+    4: {"ru": "Драка", "en": "fighting"},
+    5: {"ru": "Прилёт", "en": "arrival"},
+    6: {"ru": "Улёт", "en": "departure"},
 }
 
 BEHAVIOR_LABELS_FILE = "behavior_labels.json"
@@ -127,6 +131,8 @@ class ClassificationResult:
     behavior: Optional[BehaviorResult] = None
     best_detection: Optional[Detection] = None
     bird_count: int = 0
+    # "yolo", "clip" или "yolo+clip"
+    detection_method: str = "yolo"
 
 
 def save_bird_crops(
@@ -1751,4 +1757,7 @@ class BirdClassifier:
                 result.behavior.confidence
             )
 
+        info["detection_method"] = (
+            result.detection_method
+        )
         return info

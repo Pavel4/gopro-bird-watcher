@@ -1015,6 +1015,16 @@ class VideoMerger:
         #   для маскировки h264 artifacts.
         # unsharp — компенсирует размытие стекла
         if enhance:
+            # tmix: temporal mix 3 кадров.
+            # Битый одиночный фрейм из USB потока
+            # «растворяется» в 2 нормальных соседях.
+            # weights "1 2 1" = центральный кадр
+            # весит 2x, соседи по 1x.
+            filters.append(
+                "tmix=frames=3:weights='1 2 1'"
+            )
+            # hqdn3d: пространственный + temporal
+            # denoising для остаточных артефактов
             filters.append("hqdn3d=4:4:3:3")
             filters.append(
                 "unsharp=3:3:0.5:3:3:0.5"
@@ -1094,26 +1104,92 @@ class VideoMerger:
         
         # Шаг 4: двойной seeking + re-encode
         #
-        # Проблема: input seeking (-ss до -i)
-        # прыгает к ближайшему keyframe, но если
-        # keyframe повреждён — ВСЕ P-фреймы до
-        # следующего keyframe будут с артефактами.
-        #
-        # Решение: "двойной seeking":
+        # "двойной seeking":
         # 1. Input seeking на 3с РАНЬШЕ цели
-        #    (гарантирует декодирование с чистого
-        #    keyframe ДО нашего сегмента)
         # 2. Output seeking (-ss ПОСЛЕ -i) на 3с
-        #    (отбрасывает лишнее, точно по кадрам)
-        #
-        # Итого: декодер разогревается на 3с
-        # «чистых» данных, и к моменту нашего
-        # сегмента все reference frames корректны.
         safety_margin = 3.0
         input_ss = max(
             0, start_sec - safety_margin
         )
         output_ss = start_sec - input_ss
+
+        # === Debug: промежуточные этапы ===
+        # Сохраняем в debug_video/ для анализа
+        # на каком этапе появляются артефакты.
+        debug_dir = os.path.join(
+            os.path.dirname(output_path),
+            "..", "debug_video",
+        )
+        os.makedirs(debug_dir, exist_ok=True)
+        ts_stamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        # Этап A: сырой фрагмент .ts → mp4
+        # (stream copy, без перекодирования)
+        debug_raw = os.path.join(
+            debug_dir,
+            f"A_raw_{ts_stamp}.mp4",
+        )
+        cmd_raw = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts",
+            "-ss", str(input_ss),
+            "-i", temp_ts,
+            "-ss", str(output_ss),
+            "-t", str(duration_sec),
+            "-c", "copy",
+            "-an",
+            debug_raw,
+        ]
+        try:
+            subprocess.run(
+                cmd_raw,
+                capture_output=True,
+                timeout=60,
+            )
+            self.logger.info(
+                f"  📼 Debug A (raw copy): "
+                f"{os.path.basename(debug_raw)}"
+            )
+        except Exception:
+            pass
+
+        # Этап B: декодирование + кодирование
+        # БЕЗ фильтров (только re-encode)
+        debug_nofilter = os.path.join(
+            debug_dir,
+            f"B_nofilter_{ts_stamp}.mp4",
+        )
+        cmd_nf = [
+            "ffmpeg", "-y",
+            "-fflags", "+discardcorrupt+genpts",
+            "-err_detect", "ignore_err",
+            "-ec", "guess_mvs+deblock",
+            "-ss", str(input_ss),
+            "-i", temp_ts,
+            "-ss", str(output_ss),
+            "-t", str(duration_sec),
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "17",
+            "-an",
+            debug_nofilter,
+        ]
+        try:
+            subprocess.run(
+                cmd_nf,
+                capture_output=True,
+                timeout=120,
+            )
+            self.logger.info(
+                f"  📼 Debug B (no filter): "
+                f"{os.path.basename(debug_nofilter)}"
+            )
+        except Exception:
+            pass
+
+        # === Этап C: финальный (с фильтрами) ===
         cmd = [
             "ffmpeg", "-y",
             "-fflags", "+discardcorrupt+genpts",
@@ -1128,10 +1204,6 @@ class VideoMerger:
         if vf:
             cmd.extend(["-vf", vf])
         
-        # Сжатие ПОСЛЕ crop/scale — меньше пикселей,
-        # выше качество на каждый пиксель.
-        # slow = лучшее сжатие, CRF 17 = высокое
-        # качество. Дольше, но без артефактов.
         cmd.extend([
             "-c:v", "libx264",
             "-preset", "slow",
@@ -2422,12 +2494,21 @@ class MotionDetector:
                     self.bird_classifier
                     .get_caption_info(ml_result)
                 )
+                method = info.get(
+                    'detection_method', 'yolo'
+                )
+                method_tag = (
+                    " [CLIP]"
+                    if method == "clip"
+                    else ""
+                )
                 type_name = (
                     f"{info['name']} обнаружена"
                 )
                 if info['confidence'] > 0:
                     type_name += (
                         f" ({info['confidence']:.0%})"
+                        f"{method_tag}"
                     )
                 # Поведение в caption
                 if info.get('behavior'):
@@ -2858,13 +2939,72 @@ class MotionDetector:
                 exc_info=True,
             )
 
+    def _should_skip_clip_fallback(self, frame):
+        """
+        Проверить, стоит ли пропустить CLIP
+        fallback. Если YOLO видит не-птичьи
+        объекты (person, car и т.д.) с высокой
+        уверенностью — модель работает, просто
+        птицы нет. CLIP fallback не нужен.
+
+        CLIP нужен только когда YOLO ничего
+        не видит (< 0.1) — значит сцена
+        «невидимая» для YOLO (стекло/лёд).
+        """
+        det = getattr(
+            self.bird_classifier, 'detector', None
+        )
+        if not det:
+            return False
+        try:
+            all_dets = det.detect_all_debug(
+                frame, min_score=0.3, top_k=3,
+            )
+            if not all_dets:
+                return False  # ничего → CLIP нужен
+            # Есть уверенные не-птичьи детекции
+            non_bird = [
+                d for d in all_dets
+                if d.class_name != "bird"
+                and d.confidence >= 0.5
+            ]
+            if non_bird:
+                names = ", ".join(
+                    f"{d.class_name}"
+                    f"={d.confidence:.0%}"
+                    for d in non_bird[:3]
+                )
+                self.logger.info(
+                    f"  🧠 CLIP skip: YOLO sees "
+                    f"{names} (not bird)"
+                )
+                return True
+        except Exception:
+            pass
+        return False
+
     def _run_clip_fallback(self, visit_id=0):
         """
         Frame-diff + CLIP fallback для
         _run_classification. Сравниваем фоновый
         кадр с best_frame → находим область
         птицы → CLIP классифицирует вид.
+
+        Защита от false positive:
+        1. Skip если YOLO видит person/другой объект
+        2. Skip если diff region > 50% кадра
+        3. Сохраняем debug-кроп для отладки
         """
+        # Защита 1: YOLO видит не-птицу → skip
+        if self._should_skip_clip_fallback(
+            self._best_frame
+        ):
+            self.logger.info(
+                "  🧠 ML: no bird detected "
+                "in best frame"
+            )
+            return
+
         sc = getattr(
             self.bird_classifier,
             'species_classifier', None,
@@ -2894,13 +3034,24 @@ class MotionDetector:
             return
 
         x, y, w, h = bbox
+        img_h, img_w = self._best_frame.shape[:2]
+        region_ratio = (w * h) / (img_w * img_h)
         self.logger.info(
             f"  🔍 Diff region: "
-            f"{w}x{h} at ({x},{y})"
+            f"{w}x{h} at ({x},{y}) "
+            f"({region_ratio:.0%} of frame)"
         )
+
         clip_res = sc.classify(
             self._best_frame, bbox
         )
+
+        # Защита 3: сохраняем debug-кроп
+        self._save_clip_debug_crop(
+            self._best_frame, bbox,
+            clip_res, visit_id,
+        )
+
         if clip_res:
             try:
                 from bird_classifier import (
@@ -2913,9 +3064,10 @@ class MotionDetector:
             result.bird_detected = True
             result.bird_count = 1
             result.species = clip_res
+            result.detection_method = "clip"
             self._last_classification = result
             self.logger.info(
-                f"  🧠 ML CLIP: "
+                f"  🧠 ML CLIP (best_frame): "
                 f"{clip_res.species_ru}"
                 f" ({clip_res.confidence:.0%})"
             )
@@ -2925,9 +3077,39 @@ class MotionDetector:
                 )
         else:
             self.logger.info(
-                "  🧠 ML: CLIP no species "
-                "above threshold"
+                "  🧠 ML: no bird detected "
+                "in best frame"
             )
+
+    def _save_clip_debug_crop(
+        self, frame, bbox, clip_res, visit_id,
+    ):
+        """Сохранить debug-кроп CLIP для отладки."""
+        try:
+            x, y, w, h = bbox
+            img_h, img_w = frame.shape[:2]
+            # Добавляем padding как в classify
+            pad = int(max(w, h) * 0.2)
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(img_w, x + w + pad)
+            y2 = min(img_h, y + h + pad)
+            crop = frame[y1:y2, x1:x2]
+
+            species = "none"
+            conf = 0
+            if clip_res:
+                species = clip_res.species_en
+                conf = clip_res.confidence
+            label = (
+                f"clip_{species}"
+                f"_{int(conf * 100)}pct"
+            )
+            self._save_debug_frame(
+                crop, label, visit_id,
+            )
+        except Exception:
+            pass
 
     def _classify_from_video(self, video_path):
         """
@@ -3048,12 +3230,23 @@ class MotionDetector:
                     return
 
             # --- Stage 2: frame diff + CLIP ---
+            # Защита: если YOLO видит не-птицу
+            # (person и т.д.) → skip CLIP
+            skip_clip = False
+            if motion_frames:
+                _, first_frame = motion_frames[0]
+                skip_clip = (
+                    self._should_skip_clip_fallback(
+                        first_frame
+                    )
+                )
             sc = getattr(
                 self.bird_classifier,
                 'species_classifier', None,
             )
             if (
-                empty_frame is not None
+                not skip_clip
+                and empty_frame is not None
                 and sc and sc.is_ready()
                 and motion_frames
             ):
@@ -3068,12 +3261,23 @@ class MotionDetector:
                     if bbox is None:
                         continue
                     x, y, w, h = bbox
+                    img_h = frame.shape[0]
+                    img_w = frame.shape[1]
+                    ratio = (
+                        (w * h) / (img_w * img_h)
+                    )
                     self.logger.info(
                         f"  🔍 Diff region: "
-                        f"{w}x{h} at ({x},{y})"
+                        f"{w}x{h} at ({x},{y}) "
+                        f"({ratio:.0%})"
                     )
                     clip_res = sc.classify(
                         frame, bbox
+                    )
+                    # Debug: сохраняем кроп
+                    self._save_clip_debug_crop(
+                        frame, bbox,
+                        clip_res, vid,
                     )
                     if clip_res:
                         try:
@@ -3093,6 +3297,9 @@ class MotionDetector:
                         result.bird_detected = True
                         result.bird_count = 1
                         result.species = clip_res
+                        result.detection_method = (
+                            "clip"
+                        )
                         self._last_classification = (
                             result
                         )
