@@ -155,6 +155,9 @@ class TelegramNotifier:
         self.dp.message.register(
             self.cmd_species, Command("species")
         )
+        self.dp.message.register(
+            self.cmd_export, Command("export")
+        )
 
         # Callback-хэндлеры для inline-кнопок
         self.dp.callback_query.register(
@@ -587,16 +590,17 @@ class TelegramNotifier:
             )
 
             await callback.answer(
-                f"🎭 Поведение: {behavior_ru}"
+                f"✅ {behavior_ru}"
             )
 
             if callback.message:
+                # Обновляем caption видео
                 old_caption = (
                     callback.message.caption or ""
                 )
                 new_caption = (
                     old_caption
-                    + f"\n\n🎭 Размечено: "
+                    + f"\n\n✅ Поведение: "
                     f"{behavior_ru}"
                 )
                 try:
@@ -609,6 +613,17 @@ class TelegramNotifier:
                             parse_mode="HTML",
                             reply_markup=None,
                         )
+                    )
+                except Exception:
+                    pass
+                # Явное подтверждение отдельным
+                # сообщением
+                try:
+                    await callback.message.answer(
+                        f"✅ Визит #{visit_id}: "
+                        f"поведение → "
+                        f"<b>{behavior_ru}</b>",
+                        parse_mode="HTML",
                     )
                 except Exception:
                     pass
@@ -811,6 +826,7 @@ class TelegramNotifier:
             "/stats - Статистика визитов\n"
             "/food - Управление типом корма\n"
             "/species - Статистика по видам птиц\n"
+            "/export - Экспорт размеченных данных\n"
             "/help - Справка"
         )
         await message.answer(
@@ -831,6 +847,7 @@ class TelegramNotifier:
             "/food - Текущий корм\n"
             "/food семечки - Задать тип корма\n"
             "/species - Статистика по видам\n"
+            "/export - Экспорт размеченных данных\n"
             "/help - Эта справка\n\n"
             "<b>Автоматические уведомления:</b>\n"
             "• Видео при обнаружении птицы\n"
@@ -1069,6 +1086,190 @@ class TelegramNotifier:
                 "❌ Ошибка при получении "
                 "статистики по видам"
             )
+
+    async def cmd_export(
+        self, message: types.Message,
+    ):
+        """
+        Команда /export — экспорт размеченных данных.
+        Отправляет CSV-файлы с разметкой видов и
+        поведения + сводную статистику.
+        """
+        try:
+            files_sent = 0
+
+            # --- species_reports.csv ---
+            species_csv = self._reports_csv
+            if os.path.exists(species_csv):
+                rows = self._read_csv_rows(
+                    species_csv
+                )
+                if rows:
+                    doc = types.FSInputFile(
+                        species_csv,
+                        filename=(
+                            "species_reports.csv"
+                        ),
+                    )
+                    await message.answer_document(
+                        doc,
+                        caption=(
+                            f"📊 Разметка видов: "
+                            f"{len(rows)} записей"
+                        ),
+                    )
+                    files_sent += 1
+
+            # --- behavior_reports.csv ---
+            behavior_csv = os.path.join(
+                self.analytics_dir,
+                "behavior_reports.csv",
+            )
+            if os.path.exists(behavior_csv):
+                rows = self._read_csv_rows(
+                    behavior_csv
+                )
+                if rows:
+                    doc = types.FSInputFile(
+                        behavior_csv,
+                        filename=(
+                            "behavior_reports.csv"
+                        ),
+                    )
+                    await message.answer_document(
+                        doc,
+                        caption=(
+                            f"🎭 Разметка поведения"
+                            f": {len(rows)} записей"
+                        ),
+                    )
+                    files_sent += 1
+
+            # --- Сводка ---
+            summary = self._build_export_summary(
+                species_csv, behavior_csv
+            )
+            await message.answer(
+                summary, parse_mode="HTML"
+            )
+
+            if files_sent == 0:
+                await message.answer(
+                    "ℹ️ Нет размеченных данных. "
+                    "Размечайте видео кнопками "
+                    "под отправленными видео."
+                )
+
+        except Exception as e:
+            self.logger.error(
+                f"Error in cmd_export: {e}",
+                exc_info=True,
+            )
+            await message.answer(
+                "❌ Ошибка экспорта данных"
+            )
+
+    @staticmethod
+    def _read_csv_rows(
+        csv_path: str,
+    ) -> list:
+        """Прочитать строки CSV (без заголовка)."""
+        rows = []
+        try:
+            with open(
+                csv_path, "r", encoding="utf-8"
+            ) as f:
+                reader = csv.reader(f)
+                next(reader, None)  # skip header
+                rows = list(reader)
+        except Exception:
+            pass
+        return rows
+
+    def _build_export_summary(
+        self,
+        species_csv: str,
+        behavior_csv: str,
+    ) -> str:
+        """Сводка по размеченным данным."""
+        text = "<b>📦 Экспорт данных</b>\n\n"
+
+        # Статистика по видам
+        if os.path.exists(species_csv):
+            rows = self._read_csv_rows(species_csv)
+            confirmed = sum(
+                1 for r in rows
+                if len(r) > 4
+                and r[4] == "true"
+            )
+            corrected = sum(
+                1 for r in rows
+                if len(r) > 4
+                and r[4] == "false"
+            )
+            text += (
+                f"<b>Разметка видов:</b>\n"
+                f"  ✅ Подтверждено: "
+                f"{confirmed}\n"
+                f"  🔄 Исправлено: "
+                f"{corrected}\n"
+                f"  📝 Всего: {len(rows)}\n\n"
+            )
+            # Топ видов
+            species_counts: dict = {}
+            for r in rows:
+                if len(r) > 3:
+                    sp = r[3] if r[3] else r[2]
+                    if sp:
+                        species_counts[sp] = (
+                            species_counts.get(
+                                sp, 0
+                            )
+                            + 1
+                        )
+            if species_counts:
+                text += "<b>По видам:</b>\n"
+                sorted_sp = sorted(
+                    species_counts.items(),
+                    key=lambda x: -x[1],
+                )
+                for sp, cnt in sorted_sp[:10]:
+                    text += f"  • {sp}: {cnt}\n"
+                text += "\n"
+        else:
+            text += "Нет данных по видам.\n\n"
+
+        # Статистика по поведению
+        if os.path.exists(behavior_csv):
+            rows = self._read_csv_rows(
+                behavior_csv
+            )
+            bhv_counts: dict = {}
+            for r in rows:
+                if len(r) > 2:
+                    b = r[2]
+                    bhv_counts[b] = (
+                        bhv_counts.get(b, 0) + 1
+                    )
+            text += (
+                f"<b>Разметка поведения:</b>\n"
+                f"  📝 Всего: {len(rows)}\n"
+            )
+            if bhv_counts:
+                sorted_b = sorted(
+                    bhv_counts.items(),
+                    key=lambda x: -x[1],
+                )
+                for b, cnt in sorted_b:
+                    text += f"  • {b}: {cnt}\n"
+        else:
+            text += "Нет данных по поведению.\n"
+
+        text += (
+            "\n💡 Данные можно использовать "
+            "для дообучения ML моделей."
+        )
+        return text
 
     async def send_video(
         self,

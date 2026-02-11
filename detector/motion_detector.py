@@ -51,12 +51,22 @@ except ImportError:
         FeederAnalytics = None  # Будет работать без аналитики
 
 try:
-    from bird_classifier import BirdClassifier
+    from bird_classifier import (
+        BirdClassifier,
+        ClassificationResult,
+        SpeciesResult,
+    )
 except ImportError:
     try:
-        from detector.bird_classifier import BirdClassifier
+        from detector.bird_classifier import (
+            BirdClassifier,
+            ClassificationResult,
+            SpeciesResult,
+        )
     except ImportError:
-        BirdClassifier = None  # Будет работать без ML
+        BirdClassifier = None
+        ClassificationResult = None
+        SpeciesResult = None
 
 # gRPC-клиент для удалённого ML-инференса
 RemoteBirdClassifier = None
@@ -2494,21 +2504,20 @@ class MotionDetector:
                     self.bird_classifier
                     .get_caption_info(ml_result)
                 )
-                method = info.get(
-                    'detection_method', 'yolo'
-                )
-                method_tag = (
-                    " [CLIP]"
-                    if method == "clip"
-                    else ""
-                )
+                votes_info = ""
+                v = info.get('votes', 0)
+                t = info.get('total_frames', 0)
+                if v > 0 and t > 0:
+                    votes_info = (
+                        f" [{v}/{t}]"
+                    )
                 type_name = (
                     f"{info['name']} обнаружена"
                 )
                 if info['confidence'] > 0:
                     type_name += (
                         f" ({info['confidence']:.0%})"
-                        f"{method_tag}"
+                        f"{votes_info}"
                     )
                 # Поведение в caption
                 if info.get('behavior'):
@@ -2782,27 +2791,21 @@ class MotionDetector:
         thread.start()
     
     def _save_debug_frame(
-        self, frame, label, visit_id=0
+        self, frame, label, debug_dir=None,
     ):
         """
-        Сохранить кадр для отладки ML-детекции
-        в debug_ml/.
+        Сохранить кадр для отладки ML-детекции.
         """
-        debug_dir = os.path.join(
-            self.output_dir, "..", "debug_ml"
-        )
+        if debug_dir is None:
+            debug_dir = os.path.join(
+                self.output_dir, "..", "debug_ml"
+            )
         os.makedirs(debug_dir, exist_ok=True)
-        ts = datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
-        fname = (
-            f"v{visit_id}_{label}_{ts}.jpg"
-        )
-        path = os.path.join(debug_dir, fname)
+        path = os.path.join(debug_dir, label)
         try:
             cv2.imwrite(path, frame)
             self.logger.info(
-                f"  🖼️ Debug frame: {fname}"
+                f"  🖼️ Debug: {label}"
             )
         except Exception as e:
             self.logger.warning(
@@ -2810,331 +2813,54 @@ class MotionDetector:
                 f"frame: {e}"
             )
 
-    def _log_debug_detections(
-        self, frame, label="best_frame"
-    ):
-        """
-        Запустить detect_all_debug и вывести
-        ВСЕ обнаруженные объекты в лог (top-5).
-        """
-        if (
-            not self.bird_classifier
-            or not self.bird_classifier.detector
-        ):
-            return
-        try:
-            all_dets = (
-                self.bird_classifier.detector
-                .detect_all_debug(frame)
-            )
-            if all_dets:
-                items = [
-                    f"{d.class_name}={d.confidence:.2f}"
-                    for d in all_dets
-                ]
-                self.logger.info(
-                    f"  🔍 ML debug ({label}): "
-                    + ", ".join(items)
-                )
-            else:
-                self.logger.info(
-                    f"  🔍 ML debug ({label}): "
-                    f"nothing detected "
-                    f"(all < 0.1)"
-                )
-        except Exception as e:
-            self.logger.warning(
-                f"  ML debug error: {e}"
-            )
-
     def _run_classification(self):
         """
-        Запустить ML-классификацию на лучшем кадре
-        визита. Результат сохраняется в
-        self._last_classification.
+        Заглушка — классификация теперь выполняется
+        только через _classify_from_video() после
+        сохранения видео. Оставлен для совместимости
+        вызова из process_frame.
         """
-        try:
-            visit_id = self.stats.get(
-                'significant_motion_events', 0
-            )
-            # Debug: логируем ВСЕ обнаружения
-            self._log_debug_detections(
-                self._best_frame, "best_frame"
-            )
-            # Debug: сохраняем кадр
-            self._save_debug_frame(
-                self._best_frame,
-                "best_frame",
-                visit_id,
-            )
-
-            # Передаём буфер кадров для behavior
-            frame_buf = (
-                self._frame_buffer
-                if self._behavior_enabled
-                else None
-            )
-            result = (
-                self.bird_classifier.process_frame(
-                    self._best_frame,
-                    frame_buffer=frame_buf,
-                )
-            )
-            self._last_classification = result
-
-            if result.bird_detected:
-                caption_info = (
-                    self.bird_classifier
-                    .get_caption_info(result)
-                )
-                behavior_str = ""
-                if caption_info.get("behavior"):
-                    behavior_str = (
-                        f" — "
-                        f"{caption_info['behavior']}"
-                        f" ({caption_info['behavior_confidence']:.0%})"
-                    )
-                count_str = ""
-                if result.bird_count > 1:
-                    count_str = (
-                        f" [{result.bird_count}"
-                        f" птиц]"
-                    )
-                self.logger.info(
-                    f"  🧠 ML: "
-                    f"{caption_info['name']}"
-                    f" ({caption_info['confidence']:.0%})"
-                    f"{behavior_str}{count_str}"
-                )
-                # Сохраняем кроп для обучения
-                self.bird_classifier.save_crop(
-                    self._best_frame,
-                    result,
-                    visit_id=visit_id,
-                )
-                # Передаём вид в аналитику
-                if self.analytics:
-                    species = (
-                        self.bird_classifier
-                        .get_species_name(result)
-                    )
-                    self.analytics.set_species(
-                        species
-                    )
-                    # Передаём поведение
-                    if result.behavior:
-                        self.analytics.set_behavior(
-                            result.behavior
-                            .behavior_en
-                        )
-            else:
-                # YOLO не нашёл → fallback:
-                # frame diff + CLIP
-                self._run_clip_fallback(
-                    visit_id
-                )
-        except Exception as e:
-            self.logger.error(
-                f"ML classification error: {e}",
-                exc_info=True,
-            )
-
-    def _should_skip_clip_fallback(self, frame):
-        """
-        Проверить, стоит ли пропустить CLIP
-        fallback. Если YOLO видит не-птичьи
-        объекты (person, car и т.д.) с высокой
-        уверенностью — модель работает, просто
-        птицы нет. CLIP fallback не нужен.
-
-        CLIP нужен только когда YOLO ничего
-        не видит (< 0.1) — значит сцена
-        «невидимая» для YOLO (стекло/лёд).
-        """
-        det = getattr(
-            self.bird_classifier, 'detector', None
-        )
-        if not det:
-            return False
-        try:
-            all_dets = det.detect_all_debug(
-                frame, min_score=0.3, top_k=3,
-            )
-            if not all_dets:
-                return False  # ничего → CLIP нужен
-            # Есть уверенные не-птичьи детекции
-            non_bird = [
-                d for d in all_dets
-                if d.class_name != "bird"
-                and d.confidence >= 0.5
-            ]
-            if non_bird:
-                names = ", ".join(
-                    f"{d.class_name}"
-                    f"={d.confidence:.0%}"
-                    for d in non_bird[:3]
-                )
-                self.logger.info(
-                    f"  🧠 CLIP skip: YOLO sees "
-                    f"{names} (not bird)"
-                )
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _run_clip_fallback(self, visit_id=0):
-        """
-        Frame-diff + CLIP fallback для
-        _run_classification. Сравниваем фоновый
-        кадр с best_frame → находим область
-        птицы → CLIP классифицирует вид.
-
-        Защита от false positive:
-        1. Skip если YOLO видит person/другой объект
-        2. Skip если diff region > 50% кадра
-        3. Сохраняем debug-кроп для отладки
-        """
-        # Защита 1: YOLO видит не-птицу → skip
-        if self._should_skip_clip_fallback(
-            self._best_frame
-        ):
-            self.logger.info(
-                "  🧠 ML: no bird detected "
-                "in best frame"
-            )
-            return
-
-        sc = getattr(
-            self.bird_classifier,
-            'species_classifier', None,
-        )
-        if (
-            self._bg_frame is None
-            or self._best_frame is None
-            or not sc or not sc.is_ready()
-        ):
-            self.logger.info(
-                "  🧠 ML: no bird detected "
-                "in best frame"
-            )
-            return
-
-        self.logger.info(
-            "  🧠 YOLO failed, trying "
-            "frame-diff + CLIP on best_frame..."
-        )
-        bbox = self._find_diff_bbox(
-            self._bg_frame, self._best_frame
-        )
-        if bbox is None:
-            self.logger.info(
-                "  🧠 ML: no diff region found"
-            )
-            return
-
-        x, y, w, h = bbox
-        img_h, img_w = self._best_frame.shape[:2]
-        region_ratio = (w * h) / (img_w * img_h)
-        self.logger.info(
-            f"  🔍 Diff region: "
-            f"{w}x{h} at ({x},{y}) "
-            f"({region_ratio:.0%} of frame)"
-        )
-
-        clip_res = sc.classify(
-            self._best_frame, bbox
-        )
-
-        # Защита 3: сохраняем debug-кроп
-        self._save_clip_debug_crop(
-            self._best_frame, bbox,
-            clip_res, visit_id,
-        )
-
-        if clip_res:
-            try:
-                from bird_classifier import (
-                    ClassificationResult,
-                )
-            except ImportError:
-                from detector.bird_classifier \
-                    import ClassificationResult
-            result = ClassificationResult()
-            result.bird_detected = True
-            result.bird_count = 1
-            result.species = clip_res
-            result.detection_method = "clip"
-            self._last_classification = result
-            self.logger.info(
-                f"  🧠 ML CLIP (best_frame): "
-                f"{clip_res.species_ru}"
-                f" ({clip_res.confidence:.0%})"
-            )
-            if self.analytics:
-                self.analytics.set_species(
-                    clip_res.species_ru
-                )
-        else:
-            self.logger.info(
-                "  🧠 ML: no bird detected "
-                "in best frame"
-            )
-
-    def _save_clip_debug_crop(
-        self, frame, bbox, clip_res, visit_id,
-    ):
-        """Сохранить debug-кроп CLIP для отладки."""
-        try:
-            x, y, w, h = bbox
-            img_h, img_w = frame.shape[:2]
-            # Добавляем padding как в classify
-            pad = int(max(w, h) * 0.2)
-            x1 = max(0, x - pad)
-            y1 = max(0, y - pad)
-            x2 = min(img_w, x + w + pad)
-            y2 = min(img_h, y + h + pad)
-            crop = frame[y1:y2, x1:x2]
-
-            species = "none"
-            conf = 0
-            if clip_res:
-                species = clip_res.species_en
-                conf = clip_res.confidence
-            label = (
-                f"clip_{species}"
-                f"_{int(conf * 100)}pct"
-            )
-            self._save_debug_frame(
-                crop, label, visit_id,
-            )
-        except Exception:
-            pass
+        pass
 
     def _classify_from_video(self, video_path):
         """
-        Извлечь кадры от начала движения в видео,
-        попробовать YOLO, затем fallback на
-        frame-diff + CLIP для обнаружения птицы.
+        Мульти-кадровая классификация из видео.
+        Vogel EfficientNet-B2 + frame diff +
+        голосование.
 
         Структура видео:
-          [pre_buffer 5s][движение][post_buffer 5s]
+          [buffer 3s][движение][buffer 3s]
 
         Алгоритм:
-        1. YOLO на 3 кадрах после начала движения
-        2. Если YOLO не нашёл → frame diff:
-           сравниваем кадр БЕЗ птицы (t=1с) и
-           С птицей → находим область изменений →
-           кропим → CLIP классифицирует вид.
+        1. Читаем фоновый кадр (t=1с)
+        2. Извлекаем 5 кадров после начала движения
+        3. Для каждого: frame diff → crop →
+           VogelClassifier
+        4. Голосование: majority vote + avg confidence
+        5. Порог: < 2 голосов или avg < 50% →
+           не птица
+
+        Сохраняет debug-кропы в
+        debug_ml/{video_name}/.
         """
         if not self.bird_classifier:
+            return
+        if (
+            not self.bird_classifier.is_available()
+        ):
             return
         if not os.path.exists(video_path):
             return
 
-        vid = self.stats.get(
-            'significant_motion_events', 0
+        # Debug папка = имя видео без расширения
+        video_name = os.path.splitext(
+            os.path.basename(video_path)
+        )[0]
+        debug_dir = os.path.join(
+            self.output_dir, "..", "debug_ml",
+            video_name,
         )
+        os.makedirs(debug_dir, exist_ok=True)
 
         try:
             cap = cv2.VideoCapture(video_path)
@@ -3155,180 +2881,284 @@ class MotionDetector:
 
             pre_buf = self.buffer_seconds
             motion_start = int(pre_buf * fps)
-            offsets = [
-                int(fps * 0.5),
-                int(fps * 1.0),
-                int(fps * 1.5),
-            ]
 
-            # --- Читаем «пустой» кадр (t=1с) ---
+            # 5 точек после начала движения
+            time_offsets = [0.3, 0.8, 1.5, 2.5, 4.0]
+
+            # --- Фоновый кадр (t=1с) ---
             cap.set(
                 cv2.CAP_PROP_POS_FRAMES,
                 int(fps * 1),
             )
-            ret_e, empty_frame = cap.read()
-            if not ret_e or empty_frame is None:
-                empty_frame = None
+            ret_bg, bg_frame = cap.read()
+            if not ret_bg or bg_frame is None:
+                # Fallback: используем _bg_frame
+                bg_frame = self._bg_frame
+            if bg_frame is None:
+                cap.release()
+                self.logger.info(
+                    "  🧠 No background frame"
+                )
+                return
 
-            # --- Stage 1: YOLO на 3 кадрах ---
-            motion_frames = []
-            for i, offset in enumerate(offsets):
-                target = min(
-                    motion_start + offset,
+            # Сохраняем фон в debug
+            self._save_debug_frame(
+                bg_frame, "bg_frame.jpg",
+                debug_dir,
+            )
+
+            # --- Извлекаем кадры и классифицируем ---
+            votes = {}  # species_en → [confidences]
+            frame_results = []
+
+            for i, t_off in enumerate(
+                time_offsets
+            ):
+                target_frame = min(
+                    motion_start + int(
+                        fps * t_off
+                    ),
                     total - 1,
                 )
                 cap.set(
                     cv2.CAP_PROP_POS_FRAMES,
-                    target,
+                    target_frame,
                 )
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     continue
 
-                motion_frames.append(
-                    (target, frame)
+                # Frame diff → bbox
+                bbox = self._find_diff_bbox(
+                    bg_frame, frame
                 )
-                label = f"video_f{target}"
-                self._log_debug_detections(
-                    frame, label
+                if bbox is None:
+                    self.logger.debug(
+                        f"  Frame {i+1} "
+                        f"({t_off}s): no diff"
+                    )
+                    # Сохраняем кадр без bbox
+                    fname = (
+                        f"frame_{i+1:02d}"
+                        f"_{t_off}s_no_diff.jpg"
+                    )
+                    self._save_debug_frame(
+                        frame, fname, debug_dir,
+                    )
+                    frame_results.append({
+                        "offset": t_off,
+                        "species": None,
+                        "confidence": 0,
+                        "bbox": None,
+                    })
+                    continue
+
+                x, y, w, h = bbox
+                # Кропаем с padding
+                pad = int(max(w, h) * 0.2)
+                img_h, img_w = frame.shape[:2]
+                x1 = max(0, x - pad)
+                y1 = max(0, y - pad)
+                x2 = min(img_w, x + w + pad)
+                y2 = min(img_h, y + h + pad)
+                crop = frame[y1:y2, x1:x2]
+
+                if crop.size == 0:
+                    continue
+
+                # Классификация
+                species_res = (
+                    self.bird_classifier
+                    .vogel_classifier
+                    .classify(crop)
+                )
+
+                sp_name = "none"
+                sp_en = "none"
+                conf = 0.0
+                if species_res:
+                    sp_name = (
+                        species_res.species_ru
+                    )
+                    sp_en = species_res.species_en
+                    conf = species_res.confidence
+                    # Голос
+                    if sp_en not in votes:
+                        votes[sp_en] = []
+                    votes[sp_en].append(conf)
+
+                frame_results.append({
+                    "offset": t_off,
+                    "species": sp_name,
+                    "species_en": sp_en,
+                    "confidence": conf,
+                    "bbox": bbox,
+                })
+
+                # Debug: сохраняем кроп
+                sp_label = sp_en.replace(" ", "_")
+                fname = (
+                    f"frame_{i+1:02d}"
+                    f"_{t_off}s"
+                    f"_{sp_label}"
+                    f"_{int(conf*100)}pct.jpg"
                 )
                 self._save_debug_frame(
-                    frame, label, vid
+                    crop, fname, debug_dir,
                 )
 
-                result = (
-                    self.bird_classifier
-                    .process_frame(frame)
-                )
-                if result and result.bird_detected:
-                    self._last_classification = (
-                        result
-                    )
-                    info = (
-                        self.bird_classifier
-                        .get_caption_info(result)
-                    )
-                    self.logger.info(
-                        f"  🧠 ML YOLO (video "
-                        f"f#{target}): "
-                        f"{info['name']}"
-                        f" ({info['confidence']:.0%})"
-                    )
-                    self.bird_classifier.save_crop(
-                        frame, result,
-                        visit_id=vid,
-                    )
-                    if self.analytics:
-                        sp = (
-                            self.bird_classifier
-                            .get_species_name(result)
-                        )
-                        self.analytics.set_species(
-                            sp
-                        )
-                    cap.release()
-                    return
-
-            # --- Stage 2: frame diff + CLIP ---
-            # Защита: если YOLO видит не-птицу
-            # (person и т.д.) → skip CLIP
-            skip_clip = False
-            if motion_frames:
-                _, first_frame = motion_frames[0]
-                skip_clip = (
-                    self._should_skip_clip_fallback(
-                        first_frame
-                    )
-                )
-            sc = getattr(
-                self.bird_classifier,
-                'species_classifier', None,
-            )
-            if (
-                not skip_clip
-                and empty_frame is not None
-                and sc and sc.is_ready()
-                and motion_frames
-            ):
                 self.logger.info(
-                    "  🧠 YOLO failed, trying "
-                    "frame-diff + CLIP..."
+                    f"  🐦 Frame {i+1} "
+                    f"({t_off}s): "
+                    f"{sp_name} {conf:.0%}"
                 )
-                for target, frame in motion_frames:
-                    bbox = self._find_diff_bbox(
-                        empty_frame, frame
-                    )
-                    if bbox is None:
-                        continue
-                    x, y, w, h = bbox
-                    img_h = frame.shape[0]
-                    img_w = frame.shape[1]
-                    ratio = (
-                        (w * h) / (img_w * img_h)
-                    )
-                    self.logger.info(
-                        f"  🔍 Diff region: "
-                        f"{w}x{h} at ({x},{y}) "
-                        f"({ratio:.0%})"
-                    )
-                    clip_res = sc.classify(
-                        frame, bbox
-                    )
-                    # Debug: сохраняем кроп
-                    self._save_clip_debug_crop(
-                        frame, bbox,
-                        clip_res, vid,
-                    )
-                    if clip_res:
-                        try:
-                            from bird_classifier \
-                                import (
-                                    ClassificationResult
-                                )
-                        except ImportError:
-                            from detector \
-                                .bird_classifier \
-                                import (
-                                    ClassificationResult
-                                )
-                        result = (
-                            ClassificationResult()
-                        )
-                        result.bird_detected = True
-                        result.bird_count = 1
-                        result.species = clip_res
-                        result.detection_method = (
-                            "clip"
-                        )
-                        self._last_classification = (
-                            result
-                        )
-                        self.logger.info(
-                            f"  🧠 ML CLIP (video "
-                            f"f#{target}): "
-                            f"{clip_res.species_ru}"
-                            f" ({clip_res.confidence:.0%})"
-                        )
-                        if self.analytics:
-                            self.analytics \
-                                .set_species(
-                                    clip_res
-                                    .species_ru
-                                )
-                        cap.release()
-                        return
 
             cap.release()
-            self.logger.info(
-                "  🧠 ML (video): no bird in "
-                "3 frames (YOLO+CLIP)"
+
+            # --- Голосование ---
+            if not votes:
+                self.logger.info(
+                    "  🧠 ML: no species detected "
+                    "in any frame"
+                )
+                self._write_debug_result(
+                    debug_dir, frame_results,
+                    None, 0, 0, len(time_offsets),
+                )
+                return
+
+            # Находим вид с макс. голосами
+            best_species_en = max(
+                votes, key=lambda k: len(votes[k])
             )
+            best_votes = votes[best_species_en]
+            n_votes = len(best_votes)
+            avg_conf = (
+                sum(best_votes) / n_votes
+            )
+
+            self.logger.info(
+                f"  🗳️ Voting: "
+                f"{best_species_en} "
+                f"{n_votes}/{len(time_offsets)} "
+                f"votes, avg={avg_conf:.0%}"
+            )
+
+            # Пороги "не птица"
+            min_votes = 2
+            min_avg_conf = 0.5
+
+            if (
+                n_votes < min_votes
+                or avg_conf < min_avg_conf
+            ):
+                self.logger.info(
+                    f"  🧠 ML: not a bird "
+                    f"(votes={n_votes}<{min_votes}"
+                    f" or avg={avg_conf:.0%}"
+                    f"<{min_avg_conf:.0%})"
+                )
+                self._write_debug_result(
+                    debug_dir, frame_results,
+                    best_species_en,
+                    n_votes, avg_conf,
+                    len(time_offsets),
+                )
+                return
+
+            # Находим русское название
+            labels = getattr(
+                self.bird_classifier
+                .vogel_classifier,
+                'labels', {},
+            )
+            species_ru = best_species_en
+            for lbl in labels.values():
+                if lbl.get("en") == best_species_en:
+                    species_ru = lbl.get(
+                        "ru", best_species_en
+                    )
+                    break
+
+            # Формируем результат
+            result = ClassificationResult()
+            result.bird_detected = True
+            result.bird_count = 1
+            result.species = SpeciesResult(
+                species_ru=species_ru,
+                species_en=best_species_en,
+                confidence=avg_conf,
+            )
+            result.detection_method = "voting"
+            result.votes = n_votes
+            result.total_frames = len(
+                time_offsets
+            )
+            self._last_classification = result
+
+            self.logger.info(
+                f"  🧠 ML: {species_ru} "
+                f"({avg_conf:.0%}, "
+                f"{n_votes}/{len(time_offsets)} "
+                f"votes)"
+            )
+
+            # Аналитика
+            if self.analytics:
+                self.analytics.set_species(
+                    species_ru
+                )
+
+            # Debug result
+            self._write_debug_result(
+                debug_dir, frame_results,
+                best_species_en,
+                n_votes, avg_conf,
+                len(time_offsets),
+            )
+
         except Exception as e:
             self.logger.error(
                 f"ML video classification "
                 f"error: {e}",
                 exc_info=True,
             )
+
+    def _write_debug_result(
+        self, debug_dir, frame_results,
+        winner, votes, avg_conf, total,
+    ):
+        """Записать result.txt в debug-папку."""
+        try:
+            path = os.path.join(
+                debug_dir, "result.txt"
+            )
+            lines = []
+            lines.append("=== Voting Result ===")
+            if winner:
+                lines.append(
+                    f"Winner: {winner}"
+                )
+                lines.append(
+                    f"Votes: {votes}/{total}"
+                )
+                lines.append(
+                    f"Avg confidence: {avg_conf:.2%}"
+                )
+            else:
+                lines.append("No bird detected")
+            lines.append("")
+            lines.append("=== Frame Results ===")
+            for r in frame_results:
+                lines.append(
+                    f"  +{r['offset']}s: "
+                    f"{r.get('species', 'none')} "
+                    f"{r['confidence']:.0%}"
+                )
+            with open(path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
 
     @staticmethod
     def _find_diff_bbox(
@@ -3469,7 +3299,7 @@ class MotionDetector:
                         self.start_recording(RecordingType.MOTION)
         else:
             self.consecutive_motion_frames = 0
-            # Обновляем фон (для CLIP fallback)
+            # Обновляем фон (для frame diff)
             if not self.significant_motion_started:
                 self._bg_frame = frame.copy()
 

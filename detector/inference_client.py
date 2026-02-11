@@ -30,11 +30,30 @@ from generated import inference_pb2
 from generated import inference_pb2_grpc
 from bird_classifier import (
     ClassificationResult,
-    Detection,
     SpeciesResult,
     BehaviorResult,
-    save_bird_crops,
 )
+from dataclasses import dataclass
+
+
+@dataclass
+class Detection:
+    """Совместимость с gRPC-протоколом."""
+    class_id: int
+    class_name: str
+    confidence: float
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+def save_bird_crops(
+    frame, result, crops_dir,
+    visit_id=0, logger=None,
+):
+    """Заглушка — кропы через Vogel не нужны."""
+    pass
 
 
 # gRPC message size limits
