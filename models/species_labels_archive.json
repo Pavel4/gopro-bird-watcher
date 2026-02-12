@@ -1,12 +1,42 @@
 {
-  "0": {"ru": "Большая синица", "en": "Great Tit"},
-  "1": {"ru": "Лазоревка", "en": "Blue Tit"},
-  "2": {"ru": "Домовый воробей", "en": "House Sparrow"},
-  "3": {"ru": "Полевой воробей", "en": "Tree Sparrow"},
-  "4": {"ru": "Поползень", "en": "Nuthatch"},
-  "5": {"ru": "Снегирь", "en": "Bullfinch"},
-  "6": {"ru": "Большой пёстрый дятел", "en": "Great Spotted Woodpecker"},
-  "7": {"ru": "Зеленушка", "en": "Greenfinch"},
-  "8": {"ru": "Чиж", "en": "Siskin"},
-  "9": {"ru": "Свиристель", "en": "Waxwing"}
+  "0": {
+    "ru": "Лазоревка",
+    "en": "Blue Tit",
+    "de": "Blaumeise"
+  },
+  "1": {
+    "ru": "Зеленушка",
+    "en": "Greenfinch",
+    "de": "Grünling"
+  },
+  "2": {
+    "ru": "Домовый воробей",
+    "en": "House Sparrow",
+    "de": "Haussperling"
+  },
+  "3": {
+    "ru": "Дубонос",
+    "en": "Hawfinch",
+    "de": "Kernbeißer"
+  },
+  "4": {
+    "ru": "Поползень",
+    "en": "Nuthatch",
+    "de": "Kleiber"
+  },
+  "5": {
+    "ru": "Большая синица",
+    "en": "Great Tit",
+    "de": "Kohlmeise"
+  },
+  "6": {
+    "ru": "Зарянка",
+    "en": "European Robin",
+    "de": "Rotkehlchen"
+  },
+  "7": {
+    "ru": "Болотная гаичка",
+    "en": "Marsh Tit",
+    "de": "Sumpfmeise"
+  }
 }

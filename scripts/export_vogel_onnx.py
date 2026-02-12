@@ -4,7 +4,7 @@
 из HuggingFace в ONNX формат.
 
 Использование:
-    pip install transformers torch onnx
+    pip install transformers torch onnx onnxscript pillow
     python scripts/export_vogel_onnx.py \
         --output_dir models
 

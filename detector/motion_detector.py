@@ -1129,81 +1129,109 @@ class VideoMerger:
         # на каком этапе появляются артефакты.
         # Управляется флагом ml_debug_enabled.
         if self.ml_debug_enabled:
-            debug_dir = os.path.join(
-                os.path.dirname(output_path),
-                "..", "debug_video",
-            )
-            os.makedirs(
-                debug_dir, exist_ok=True
-            )
-            ts_stamp = datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
-            )
-
-            # Этап A: сырой фрагмент .ts → mp4
-            # (stream copy, без перекодирования)
-            debug_raw = os.path.join(
-                debug_dir,
-                f"A_raw_{ts_stamp}.mp4",
-            )
-            cmd_raw = [
-                "ffmpeg", "-y",
-                "-fflags", "+genpts",
-                "-ss", str(input_ss),
-                "-i", temp_ts,
-                "-ss", str(output_ss),
-                "-t", str(duration_sec),
-                "-c", "copy",
-                "-an",
-                debug_raw,
-            ]
             try:
-                subprocess.run(
+                debug_dir = os.path.join(
+                    os.path.dirname(
+                        output_path
+                    ),
+                    "..", "debug_video",
+                )
+                os.makedirs(
+                    debug_dir, exist_ok=True
+                )
+                ts_stamp = (
+                    datetime.now().strftime(
+                        "%Y%m%d_%H%M%S"
+                    )
+                )
+
+                # Этап A: stream copy
+                debug_raw = os.path.join(
+                    debug_dir,
+                    f"A_raw_{ts_stamp}.mp4",
+                )
+                cmd_raw = [
+                    "ffmpeg", "-y",
+                    "-fflags", "+genpts",
+                    "-ss", str(input_ss),
+                    "-i", temp_ts,
+                    "-ss", str(output_ss),
+                    "-t", str(duration_sec),
+                    "-c", "copy",
+                    "-an",
+                    debug_raw,
+                ]
+                self.logger.info(
+                    "  📼 Debug A: starting "
+                    "raw copy..."
+                )
+                r_a = subprocess.run(
                     cmd_raw,
-                    capture_output=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=60,
                 )
-                self.logger.info(
-                    f"  📼 Debug A (raw copy)"
-                    f": {os.path.basename(debug_raw)}"
-                )
-            except Exception:
-                pass
+                if r_a.returncode == 0:
+                    self.logger.info(
+                        "  📼 Debug A (raw copy)"
+                        ": "
+                        f"{os.path.basename(debug_raw)}"
+                    )
+                else:
+                    self.logger.warning(
+                        "  📼 Debug A failed: "
+                        f"rc={r_a.returncode}"
+                    )
 
-            # Этап B: декодирование + кодирование
-            # БЕЗ фильтров (только re-encode)
-            debug_nofilter = os.path.join(
-                debug_dir,
-                f"B_nofilter_{ts_stamp}.mp4",
-            )
-            cmd_nf = [
-                "ffmpeg", "-y",
-                "-fflags",
-                "+discardcorrupt+genpts",
-                "-err_detect", "ignore_err",
-                "-ec", "guess_mvs+deblock",
-                "-ss", str(input_ss),
-                "-i", temp_ts,
-                "-ss", str(output_ss),
-                "-t", str(duration_sec),
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "17",
-                "-an",
-                debug_nofilter,
-            ]
-            try:
-                subprocess.run(
+                # Этап B: re-encode без фильтров
+                debug_nofilter = os.path.join(
+                    debug_dir,
+                    f"B_nofilter_"
+                    f"{ts_stamp}.mp4",
+                )
+                cmd_nf = [
+                    "ffmpeg", "-y",
+                    "-fflags",
+                    "+discardcorrupt+genpts",
+                    "-err_detect",
+                    "ignore_err",
+                    "-ec",
+                    "guess_mvs+deblock",
+                    "-ss", str(input_ss),
+                    "-i", temp_ts,
+                    "-ss", str(output_ss),
+                    "-t", str(duration_sec),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "17",
+                    "-an",
+                    debug_nofilter,
+                ]
+                self.logger.info(
+                    "  📼 Debug B: starting "
+                    "re-encode..."
+                )
+                r_b = subprocess.run(
                     cmd_nf,
-                    capture_output=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=120,
                 )
-                self.logger.info(
-                    f"  📼 Debug B (no filter)"
-                    f": {os.path.basename(debug_nofilter)}"
+                if r_b.returncode == 0:
+                    self.logger.info(
+                        "  📼 Debug B (no filter)"
+                        ": "
+                        f"{os.path.basename(debug_nofilter)}"
+                    )
+                else:
+                    self.logger.warning(
+                        "  📼 Debug B failed: "
+                        f"rc={r_b.returncode}"
+                    )
+            except Exception as e:
+                self.logger.warning(
+                    f"  📼 Debug steps error: {e}"
                 )
-            except Exception:
-                pass
 
         # === Этап C: финальный (с фильтрами) ===
         cmd = [
@@ -1230,13 +1258,15 @@ class VideoMerger:
         
         self.logger.info(
             f"Encode: slow CRF 17 "
-            f"(post-crop, max quality)"
+            f"(post-crop, max quality), "
+            f"input={os.path.basename(temp_ts)}"
         )
         
         try:
             result = subprocess.run(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 timeout=300,
             )
             
@@ -2246,12 +2276,33 @@ class MotionDetector:
             self.is_recording = False
             self._finalizing = True
         
-        # Остальная работа вне блокировки (занимает время)
-        
-        # Ждём пока FFmpeg допишет последние сегменты
-        # (post_motion_seconds уже прошли, нужно только дождаться финализации)
+        # Остальная работа вне блокировки
+        # (занимает время)
+        try:
+            self._finalize_recording(
+                was_recording_type
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Recording finalization "
+                f"error: {e}",
+                exc_info=True,
+            )
+        finally:
+            self._reset_recording_state()
+        return
+
+    def _finalize_recording(
+        self, was_recording_type,
+    ):
+        """Финализировать и сохранить запись."""
+        # Ждём пока FFmpeg допишет последние
+        # сегменты
         wait_time = self.segment_duration + 1
-        self.logger.info(f"Finalizing recording ({wait_time}s)...")
+        self.logger.info(
+            f"Finalizing recording "
+            f"({wait_time}s)..."
+        )
         time.sleep(wait_time)
         
         # Время окончания = СЕЙЧАС (после ожидания), чтобы включить все сегменты
@@ -2272,18 +2323,28 @@ class MotionDetector:
         )
         
         if not segments:
-            self.logger.warning("No segments found for recording")
-            self._reset_recording_state()
+            self.logger.warning(
+                "No segments found for "
+                "recording"
+            )
             return
         
-        # Проверяем что сегменты действительно свежие
-        newest_segment_time = max(os.path.getmtime(s) for s in segments)
-        if newest_segment_time < self.recording_start_time - 5:
+        # Проверяем что сегменты свежие
+        newest_segment_time = max(
+            os.path.getmtime(s)
+            for s in segments
+        )
+        if (
+            newest_segment_time
+            < self.recording_start_time - 5
+        ):
             self.logger.warning(
-                f"⚠️ Segments are stale! Newest: {newest_segment_time:.0f}, "
-                f"recording started: {self.recording_start_time:.0f}"
+                "⚠️ Segments are stale! "
+                f"Newest: "
+                f"{newest_segment_time:.0f}, "
+                "recording started: "
+                f"{self.recording_start_time:.0f}"
             )
-            self._reset_recording_state()
             return
         
         # Формируем имя файла
@@ -2447,8 +2508,6 @@ class MotionDetector:
                     os.remove(temp_filepath)
                 except Exception:
                     pass
-        
-        self._reset_recording_state()
     
     def _reset_recording_state(self):
         """Сбросить состояние записи."""

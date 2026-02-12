@@ -1414,13 +1414,45 @@ class TelegramNotifier:
             return False
     
     async def start_polling(self):
-        """Запустить polling для получения команд от пользователя."""
-        try:
-            self.logger.info("Starting Telegram bot polling...")
-            # handle_signals=False - чтобы работать в фоновом потоке
-            await self.dp.start_polling(self.bot, handle_signals=False)
-        except Exception as e:
-            self.logger.error(f"Error in bot polling: {e}", exc_info=True)
+        """
+        Запустить polling с автоматическим
+        переподключением при ошибках сети.
+        Retry с exponential backoff (5s..300s).
+        """
+        retry_delay = 5
+        max_delay = 300
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                self.logger.info(
+                    "Starting Telegram bot "
+                    "polling"
+                    f" (attempt {attempt})..."
+                )
+                await self.dp.start_polling(
+                    self.bot,
+                    handle_signals=False,
+                )
+                # Нормальный выход (stop())
+                break
+            except Exception as e:
+                self.logger.error(
+                    "Error in bot polling: "
+                    f"{e}"
+                )
+                delay = min(
+                    retry_delay * (
+                        2 ** (attempt - 1)
+                    ),
+                    max_delay,
+                )
+                self.logger.info(
+                    "Retrying Telegram "
+                    f"in {delay}s..."
+                )
+                await asyncio.sleep(delay)
     
     async def close(self):
         """Закрыть соединение с Telegram."""
