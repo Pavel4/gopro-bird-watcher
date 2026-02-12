@@ -1,0 +1,24 @@
+# Зависимости для обучения классификатора
+# поведения птиц (TSM-MobileNetV3)
+#
+# Установка:
+#   pip install -r scripts/requirements-behavior.txt
+#
+# Нужны ТОЛЬКО для обучения.
+# Для production-инференса: onnxruntime + numpy.
+
+# PyTorch и torchvision
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Обучение и метрики
+scikit-learn>=1.3.0
+
+# Обработка изображений
+opencv-python>=4.8.0
+
+# Прогресс-бары
+tqdm>=4.65.0
+
+# ONNX экспорт и runtime
+onnxruntime>=1.17.0

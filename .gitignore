@@ -18,6 +18,7 @@ venv/
 # Recordings (keep folder structure via .gitkeep)
 recordings/motion/*.mp4
 recordings/manual/*.mp4
+recordings/debug_video/*.mp4
 recordings/.segments/
 recordings/.recording/
 
@@ -36,10 +37,13 @@ credentials.env
 # ML models and training data
 models/*.onnx
 models/*.onnx.data
-models/*.npz
-models/training_report.json
 models/clip_embeddings.npz
+models/training_report.json
 data/
+debug_ml/
+
+# species_head_weights.npz хранится в репе (22KB)
+# Это обученная голова классификатора (10x512 + bias)
 
 # Bird crops (collected during inference)
 crops/
@@ -49,6 +53,9 @@ get_chat_id.py
 
 # Test artifacts
 test_motion_simulation.py
+
+# Scientific papers and datasets (downloaded)
+docs/papers/
 
 # Asset images from IDE
 assets/

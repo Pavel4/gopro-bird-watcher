@@ -35,6 +35,7 @@ VISITS_HEADERS = [
     "hour",
     "weekday",
     "species",
+    "behavior",
 ]
 
 FOOD_LOG_HEADERS = [
@@ -95,9 +96,12 @@ class FeederAnalytics:
         self._visit_max_area = 0.0
         self._last_video_file = None
         self._current_species = None
+        self._current_behavior = None
 
         # Счётчик визитов (загружается из CSV)
         self._next_visit_id = 1
+        # Последний завершённый visit_id
+        self.last_visit_id = 0
 
         # Пути к CSV-файлам
         os.makedirs(self.analytics_dir, exist_ok=True)
@@ -212,6 +216,7 @@ class FeederAnalytics:
             self._visit_max_area = motion_percent
             self._last_video_file = None
             self._current_species = None
+            self._current_behavior = None
 
     def visit_update(self, motion_percent: float):
         """
@@ -267,6 +272,7 @@ class FeederAnalytics:
 
             visit_id = self._next_visit_id
             self._next_visit_id += 1
+            self.last_visit_id = visit_id
 
             video_file = self._last_video_file or ""
 
@@ -284,6 +290,7 @@ class FeederAnalytics:
                 start_dt.hour,
                 start_dt.weekday(),
                 self._current_species or "unknown",
+                self._current_behavior or "",
             ]
             self._append_csv(self.visits_csv, row)
 
@@ -305,6 +312,7 @@ class FeederAnalytics:
             self._visit_max_area = 0.0
             self._last_video_file = None
             self._current_species = None
+            self._current_behavior = None
 
     def set_species(self, species_name: str):
         """
@@ -314,6 +322,15 @@ class FeederAnalytics:
         with self._lock:
             if self._visit_active:
                 self._current_species = species_name
+
+    def set_behavior(self, behavior_en: str):
+        """
+        Задать поведение для текущего визита.
+        Вызывается ML-модулем после классификации.
+        """
+        with self._lock:
+            if self._visit_active:
+                self._current_behavior = behavior_en
 
     # === API корма ===
 

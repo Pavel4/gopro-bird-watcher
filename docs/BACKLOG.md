@@ -20,6 +20,9 @@
 **Описание:** Внутри видео могут встречаться короткие артефакты (глитчи, замирания).
 **Причина:** Прямая запись через FFmpeg + AVFoundation иногда дает сбои при высокой нагрузке на CPU.
 **Приоритет:** Низкий
+**Mitigation:** Добавлены `-fflags +discardcorrupt+genpts`
+в запись и извлечение. Фильтры `hqdn3d` + `unsharp`
+при `ENHANCE_VIDEO=true` дополнительно маскируют артефакты.
 
 ### [LIMITATION] macOS: нет pre-buffer (буфера до начала движения)
 
@@ -56,6 +59,27 @@
 — CLIP ViT-B/32 linear probe.
 `SpeciesClassifier` обновлён для CLIP-based инференса
 (clip_visual.onnx + species_head_weights.npz).
+
+### [FEATURE] ~~Распределённый инференс (Edge + Compute)~~
+
+~~Разделить систему на роли: edge (Raspberry Pi — камера,
+детекция движения) и compute (PC/Mac — ML-инференс
+с GPU). Один репозиторий, разные конфиги.~~
+
+**DONE:** Реализована распределённая архитектура
+через gRPC. Три роли: `edge`, `compute`, `standalone`.
+- `proto/inference.proto` — определение gRPC-сервиса
+- `detector/inference_server.py` — gRPC-сервер
+  (роль compute), оборачивает BirdClassifier
+- `detector/inference_client.py` —
+  `RemoteBirdClassifier` с тем же интерфейсом
+  что `BirdClassifier` (Strategy pattern)
+- `motion_detector.py` — при `INFERENCE_MODE=remote`
+  прозрачно использует удалённый инференс
+- `config.compute.env` — конфиг compute-сервера
+- `docker-compose.compute.yml` — Docker для compute
+  (с поддержкой NVIDIA GPU)
+- `run-native.sh --role edge|compute|standalone`
 
 ### [FEATURE] Веб-интерфейс для просмотра записей
 
@@ -144,6 +168,63 @@ encoder + линейный классификатор (10 видов).
 Данные: `scripts/download_bird_images.py` (iNaturalist).
 Fallback: MobileNetV3 если CLIP слишком тяжёлый для Pi.
 
+**DONE (Phase 2):** Обратная связь по классификации.
+Inline-кнопки «Верно/Неверно» под видео в Telegram.
+Репорты сохраняются в `analytics/species_reports.csv`.
+Кропы с исправлениями → `data/corrections/{species}/`
+для переобучения. Обновлена документация и `/help`.
+
+**DONE (Phase 2.1):** Расширение датасета до 10K фото
+(1000/класс). Голова `species_head_weights.npz` (22KB)
+хранится в репе. Accuracy: ~80% (потолок linear probe).
+
+#### [FEATURE] MLP-голова для классификатора видов
+
+Заменить LogisticRegression (linear probe) на MLP-голову
+(2-3 слоя с ReLU) для нелинейных решающих границ.
+Ожидаемый прирост: +3-5% accuracy.
+- Архитектура: 512 → 256 → 128 → 10
+- Обучение через PyTorch (SGD + LR scheduler)
+- Экспорт в ONNX (вместо .npz — единая модель)
+- Сохранение обратной совместимости с текущим
+  `SpeciesClassifier` интерфейсом
+**Приоритет:** Высокий
+
+#### [FEATURE] Специализированная модель для птиц
+
+Перейти с общего CLIP ViT-B/32 на модель, обученную
+на птицах:
+- **BioCLIP** — CLIP, дообученный на iNaturalist
+  (10M изображений живой природы)
+- **NABirds ViT** — ViT, fine-tuned на 555 видов
+  североамериканских птиц
+- **Google Birds** — EfficientNet-based классификатор
+Подход: извлечь эмбеддинги из специализированного
+backbone → обучить голову на 10 классов.
+Ожидаемый прирост: +10-15% accuracy.
+**Приоритет:** Средний
+
+#### [FEATURE] ML-распознавание поведения птиц
+
+Автоматическая классификация поведения птицы
+на кормушке:
+- **Классы:** Кормление (Feeding), Сидение
+  (Perching), Озирание (Alert), Драка (Fighting),
+  Прилёт (Arrival), Улёт (Departure)
+- **Архитектура:** TSM-MobileNetV3
+  (Temporal Shift Module + MobileNetV3 backbone)
+- Вход: буфер 8-16 кадров (1-2 секунды видео)
+- Кольцевой буфер кадров в MotionDetector
+- `BehaviorClassifier` в `bird_classifier.py`
+- Скрипт обучения `train_behavior_classifier.py`
+- Добавление поведения в caption Telegram
+- Telegram-кнопки для разметки поведения
+  (сбор данных для обучения)
+- Новое поле `behavior` в visits.csv
+- Оптимизация для Raspberry Pi через ONNX Runtime
+- **Ref:** Visual WetlandBirds Dataset (2025),
+  TSM (2019), EdgeOAR (2024)
+
 #### [FEATURE] BirdNET-PI — распознавание по звуку
 
 Интеграция с [BirdNET](https://birdnetpi.com/) для
@@ -178,14 +259,21 @@ Telegram-команды `/stats`, `/food`.
 Графики (matplotlib/Plotly) — планируется для
 веб-интерфейса.
 
-#### [FEATURE] Улучшение качества видео (пост-обработка)
+#### [FEATURE] ~~Улучшение качества видео (пост-обработка)~~
 
-Добавить FFmpeg-фильтры для улучшения качества при извлечении:
-- `hqdn3d` — шумоподавление (убирает шум от стекла и сжатия)
-- `unsharp` — повышение резкости (компенсирует размытие стекла)
-- `lanczos` scaling — качественный апскейлинг
-- Параметр: `ENHANCE_VIDEO=true`, флаг `--enhance`
-- Подробный анализ: [docs/VIDEO_QUALITY.md](VIDEO_QUALITY.md)
+~~Добавить FFmpeg-фильтры для улучшения качества при извлечении:~~
+~~- `hqdn3d` — шумоподавление (убирает шум от стекла и сжатия)~~
+~~- `unsharp` — повышение резкости (компенсирует размытие стекла)~~
+~~- `lanczos` scaling — качественный апскейлинг~~
+~~- Параметр: `ENHANCE_VIDEO=true`, флаг `--enhance`~~
+~~- Подробный анализ: [docs/VIDEO_QUALITY.md](VIDEO_QUALITY.md)~~
+
+**DONE:** Реализовано в `VideoMerger._build_vf_filter()`.
+Фильтры `hqdn3d=3:3:2:2` (шумоподавление) и
+`unsharp=3:3:0.5:3:3:0.5` (резкость) применяются
+при `ENHANCE_VIDEO=true` в конфиге.
+Также добавлены `-fflags +discardcorrupt+genpts` в
+запись и извлечение для отбрасывания битых пакетов.
 
 #### [RESEARCH] OpenGoPro API — нативная запись 4K
 

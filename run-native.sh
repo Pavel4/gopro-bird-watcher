@@ -3,6 +3,7 @@
 # Автоматически определяет платформу и использует нужный конфиг
 #
 # Флаги:
+#   --role ROLE    Роль устройства: edge, compute, standalone (default)
 #   --full-frame   Детектировать на всём кадре (игнорировать ROI)
 #   --no-crop      Не обрезать видео (игнорировать CROP)
 
@@ -17,9 +18,14 @@ CROP_ARGS=""       # --crop X,Y,W,H
 CROP_PAD_ARG=""    # --crop-pad N
 CROP_SCALE_ARG=""  # --crop-scale WxH
 SHOW_HELP=""
+DEVICE_ROLE=""     # edge, compute, standalone
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --role)
+            shift
+            DEVICE_ROLE="${1:-}"
+            ;;
         --full-frame|--no-roi)
             OVERRIDE_ROI="true"
             ;;
@@ -49,6 +55,10 @@ if [ -n "$SHOW_HELP" ]; then
     echo "Использование: ./run-native.sh [флаги]"
     echo ""
     echo "Флаги:"
+    echo "  --role ROLE        Роль устройства:"
+    echo "      standalone     Всё локально (default)"
+    echo "      edge           Камера + детекция, ML через gRPC"
+    echo "      compute        gRPC-сервер ML-инференса"
     echo "  --full-frame       Детекция на всём кадре (игнорировать ROI)"
     echo "  --no-crop          Не обрезать видео"
     echo "  --crop X,Y,W,H    Обрезка: абсолютные координаты"
@@ -60,7 +70,9 @@ if [ -n "$SHOW_HELP" ]; then
     echo "                     Пример: --crop-scale 1280x720"
     echo ""
     echo "Примеры:"
-    echo "  ./run-native.sh                            # из конфига"
+    echo "  ./run-native.sh                            # standalone"
+    echo "  ./run-native.sh --role edge                # edge (Pi)"
+    echo "  ./run-native.sh --role compute             # ML server"
     echo "  ./run-native.sh --crop-pad 100             # ROI + 100px"
     echo "  ./run-native.sh --crop 200,50,800,600      # точные координаты"
     echo "  ./run-native.sh --crop-pad 150 --crop-scale 1280x720"
@@ -76,7 +88,11 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${BLUE}════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}   🎥 Запуск детектора движения GoPro (Native)${NC}"
+if [[ "$DEVICE_ROLE" == "compute" ]]; then
+    echo -e "${BLUE}   🧠 Bird Watcher Inference Server${NC}"
+else
+    echo -e "${BLUE}   🎥 Запуск детектора движения GoPro (Native)${NC}"
+fi
 echo -e "${BLUE}════════════════════════════════════════════════${NC}"
 echo ""
 
@@ -93,6 +109,11 @@ else
     CONFIG_FILE="config.env"
     PLATFORM="Linux"
     PLATFORM_EMOJI="🐧"
+fi
+
+# Для роли compute — переопределяем конфиг
+if [[ "$DEVICE_ROLE" == "compute" ]]; then
+    CONFIG_FILE="config.compute.env"
 fi
 
 echo -e "${GREEN}$PLATFORM_EMOJI Платформа: $PLATFORM${NC}"
@@ -170,7 +191,14 @@ done < "$CONFIG_FILE"
 
 # Создание необходимых директорий
 echo -e "${BLUE}📁 Создание директорий...${NC}"
-mkdir -p recordings/motion recordings/manual logs control
+if [[ "$DEVICE_ROLE" == "compute" ]]; then
+    mkdir -p models logs
+else
+    mkdir -p recordings/motion recordings/manual logs control
+fi
+
+# Проверки для edge/standalone (не compute)
+if [[ "$DEVICE_ROLE" != "compute" ]]; then
 
 # Проверка GoPro подключения (только для информации)
 echo ""
@@ -249,6 +277,8 @@ if ! command -v ffmpeg &> /dev/null; then
     exit 1
 fi
 
+fi  # конец проверок для edge/standalone
+
 echo -e "${GREEN}✅ Все проверки пройдены${NC}"
 
 # Применяем флаги командной строки
@@ -282,11 +312,24 @@ if [ -n "$CROP_SCALE_ARG" ]; then
     echo -e "${GREEN}🔲 --crop-scale: ${CROP_SCALE_ARG}${NC}"
 fi
 
+# Применяем роль устройства
+if [[ "$DEVICE_ROLE" == "edge" ]]; then
+    export INFERENCE_MODE=remote
+    echo -e "${GREEN}🔗 --role edge: ML инференс через gRPC (remote)${NC}"
+    echo -e "${GREEN}   Сервер: ${INFERENCE_SERVER_HOST:-localhost}:${INFERENCE_SERVER_PORT:-50051}${NC}"
+fi
+
 echo ""
 echo "Для остановки нажмите Ctrl+C"
 echo ""
 echo -e "${BLUE}════════════════════════════════════════════════${NC}"
 echo ""
 
-# Запуск детектора
-exec python detector/motion_detector.py
+# Запуск в зависимости от роли
+if [[ "$DEVICE_ROLE" == "compute" ]]; then
+    echo -e "${GREEN}🧠 Запуск Inference Server (compute)...${NC}"
+    exec python detector/inference_server.py
+else
+    # edge или standalone — запускаем детектор
+    exec python detector/motion_detector.py
+fi
