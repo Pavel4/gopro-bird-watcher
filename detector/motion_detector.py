@@ -992,8 +992,15 @@ class SegmentRecorder:
 class VideoMerger:
     """Объединяет сегменты в итоговое видео через FFmpeg."""
     
-    def __init__(self, logger: logging.Logger = None):
-        self.logger = logger or logging.getLogger(__name__)
+    def __init__(
+        self,
+        logger: logging.Logger = None,
+        ml_debug_enabled: bool = True,
+    ):
+        self.logger = (
+            logger or logging.getLogger(__name__)
+        )
+        self.ml_debug_enabled = ml_debug_enabled
     
     @staticmethod
     def _build_vf_filter(
@@ -1519,14 +1526,50 @@ def get_video_duration(filepath: str) -> float:
     """Получить длительность видео через ffprobe."""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
+            ["ffprobe", "-v", "quiet",
+             "-show_entries", "format=duration",
+             "-of",
+             "default=noprint_wrappers=1"
+             ":nokey=1",
+             filepath],
             capture_output=True,
-            timeout=10
+            timeout=10,
         )
-        return float(result.stdout.decode().strip())
+        return float(
+            result.stdout.decode().strip()
+        )
     except Exception:
         return 0.0
+
+
+def get_video_dimensions(
+    filepath: str,
+) -> tuple:
+    """
+    Получить ширину и высоту видео
+    через ffprobe.
+    Returns: (width, height) или (0, 0)
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-select_streams", "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                filepath,
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        out = result.stdout.decode().strip()
+        if "x" in out:
+            w, h = out.split("x")[:2]
+            return int(w), int(h)
+    except Exception:
+        pass
+    return 0, 0
 
 
 class MotionDetector:
@@ -1652,7 +1695,10 @@ class MotionDetector:
             usb_resolution=self.usb_resolution,
             usb_fps=self.usb_fps
         )
-        self.video_merger = VideoMerger(logger=self.logger)
+        self.video_merger = VideoMerger(
+            logger=self.logger,
+            ml_debug_enabled=ml_debug_enabled,
+        )
         
         # OpenCV для анализа
         self.cap = None
@@ -2602,9 +2648,13 @@ class MotionDetector:
                     )
                 # Данные для inline-кнопок
                 if info.get('species'):
-                    visit_id = self.stats.get(
-                        'significant_motion_events',
-                        0,
+                    visit_id = (
+                        self.analytics.last_visit_id
+                        if self.analytics
+                        else self.stats.get(
+                            'significant_motion_events',
+                            0,
+                        )
                     )
                     species_info = {
                         'species_en': (
@@ -2644,41 +2694,82 @@ class MotionDetector:
             f"{food_line}"
         )
         
-        # Inline-кнопки для обратной связи по ML
+        # Inline-кнопки для обратной связи
         reply_markup = None
         behavior_markup = None
         notifier = self.telegram_notifier
-        if species_info and notifier:
-            vid = species_info['visit_id']
-            notifier.register_pending_report(
-                visit_id=vid,
-                species_en=(
-                    species_info['species_en']
-                ),
-                species_ru=(
-                    species_info['species_ru']
-                ),
-                confidence=(
-                    species_info['confidence']
-                ),
-                video_file=os.path.basename(
-                    video_path
-                ),
-                behavior_en=(
-                    species_info.get(
-                        'behavior_en', ''
-                    )
-                ),
+        visit_id = (
+            self.analytics.last_visit_id
+            if self.analytics
+            else self.stats.get(
+                'significant_motion_events', 0
             )
-            reply_markup = (
-                notifier
-                .build_species_keyboard(vid)
-            )
-            # Кнопки разметки поведения
+        )
+
+        if notifier and (
+            recording_type == RecordingType.MOTION
+        ):
+            # Кнопки поведения — всегда для
+            # MOTION записей
             behavior_markup = (
                 notifier
-                .build_behavior_keyboard(vid)
+                .build_behavior_keyboard(
+                    visit_id
+                )
             )
+
+            if species_info:
+                # Кнопки Верно/Неверно — когда
+                # ML определил вид
+                vid = species_info['visit_id']
+                notifier.register_pending_report(
+                    visit_id=vid,
+                    species_en=(
+                        species_info[
+                            'species_en'
+                        ]
+                    ),
+                    species_ru=(
+                        species_info[
+                            'species_ru'
+                        ]
+                    ),
+                    confidence=(
+                        species_info[
+                            'confidence'
+                        ]
+                    ),
+                    video_file=(
+                        os.path.basename(
+                            video_path
+                        )
+                    ),
+                    behavior_en=(
+                        species_info.get(
+                            'behavior_en', ''
+                        )
+                    ),
+                )
+                reply_markup = (
+                    notifier
+                    .build_species_keyboard(vid)
+                )
+            else:
+                # ML не определил вид —
+                # показываем клавиатуру
+                # выбора вида вручную
+                reply_markup = (
+                    notifier
+                    ._build_correction_keyboard(
+                        visit_id
+                    )
+                )
+
+        # Размеры видео для корректного
+        # отображения в Telegram
+        vid_w, vid_h = get_video_dimensions(
+            video_path
+        )
 
         # Отправка в отдельном потоке
         logger = self.logger
@@ -2760,27 +2851,44 @@ class MotionDetector:
                             max_retries
                         ):
                             try:
-                                await bot.send_video(
-                                    chat_id=(
+                                send_kwargs = {
+                                    "chat_id": (
                                         notifier
                                         .chat_id
                                     ),
-                                    video=video_file,
-                                    caption=(
+                                    "video": (
+                                        video_file
+                                    ),
+                                    "caption": (
                                         caption[:1024]
                                         if caption
                                         else None
                                     ),
-                                    parse_mode="HTML",
-                                    supports_streaming=(
+                                    "parse_mode": (
+                                        "HTML"
+                                    ),
+                                    "supports_streaming": (
                                         True
                                     ),
-                                    reply_markup=(
+                                    "reply_markup": (
                                         keyboard
                                     ),
-                                    request_timeout=(
+                                    "request_timeout": (
                                         300
                                     ),
+                                }
+                                if vid_w > 0:
+                                    send_kwargs[
+                                        "width"
+                                    ] = vid_w
+                                if vid_h > 0:
+                                    send_kwargs[
+                                        "height"
+                                    ] = vid_h
+                                await (
+                                    bot.send_video(
+                                        **send_kwargs
+                                    )
                                 )
                                 break
                             except (
@@ -2977,14 +3085,16 @@ class MotionDetector:
             ]
 
             # --- Фоновый кадр ---
-            # Берём кадр из первых секунд
-            # (пустая кормушка до движения).
-            # Если motion_start=0, берём
-            # fallback из _bg_frame.
-            bg_frame = None
-            if motion_start > 0:
+            # Приоритет: _bg_frame (кадр из цикла
+            # детекции, гарантированно без птицы).
+            # Fallback: кадр t=1с из pre-buffer
+            # (может содержать птицу, если она
+            # прилетела до триггера движения).
+            bg_frame = self._bg_frame
+            if bg_frame is None and motion_start > 0:
                 bg_pos = min(
-                    int(fps * 1), motion_start - 1
+                    int(fps * 1),
+                    motion_start - 1,
                 )
                 cap.set(
                     cv2.CAP_PROP_POS_FRAMES,
@@ -2993,10 +3103,10 @@ class MotionDetector:
                 ret_bg, bg_frame = cap.read()
                 if not ret_bg:
                     bg_frame = None
-
-            # Fallback: используем _bg_frame
-            if bg_frame is None:
-                bg_frame = self._bg_frame
+                self.logger.debug(
+                    "  🧠 Using video frame "
+                    "as bg (no _bg_frame)"
+                )
             if bg_frame is None:
                 cap.release()
                 self.logger.info(
@@ -3157,8 +3267,14 @@ class MotionDetector:
             )
 
             # Пороги "не птица"
+            # min_votes: хотя бы 2 из 5 кадров
+            # min_avg_conf: снижен до 10%,
+            # т.к. Vogel 0.8MB модель даёт
+            # низкий confidence даже на явных
+            # птицах. Главный сигнал — кол-во
+            # голосов (consistency).
             min_votes = 2
-            min_avg_conf = 0.5
+            min_avg_conf = 0.10
 
             if (
                 n_votes < min_votes

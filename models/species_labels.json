@@ -1,42 +1,42 @@
 {
   "0": {
-    "ru": "blaumeise",
-    "en": "blaumeise",
+    "ru": "Лазоревка",
+    "en": "Blue Tit",
     "de": "blaumeise"
   },
   "1": {
-    "ru": "grünling",
-    "en": "grünling",
+    "ru": "Зеленушка",
+    "en": "Greenfinch",
     "de": "grünling"
   },
   "2": {
-    "ru": "haussperling",
-    "en": "haussperling",
+    "ru": "Домовый воробей",
+    "en": "House Sparrow",
     "de": "haussperling"
   },
   "3": {
-    "ru": "kernbeißer",
-    "en": "kernbeißer",
+    "ru": "Дубонос",
+    "en": "Hawfinch",
     "de": "kernbeißer"
   },
   "4": {
-    "ru": "kleiber",
-    "en": "kleiber",
+    "ru": "Поползень",
+    "en": "Nuthatch",
     "de": "kleiber"
   },
   "5": {
-    "ru": "kohlmeise",
-    "en": "kohlmeise",
+    "ru": "Большая синица",
+    "en": "Great Tit",
     "de": "kohlmeise"
   },
   "6": {
-    "ru": "rotkehlchen",
-    "en": "rotkehlchen",
+    "ru": "Зарянка",
+    "en": "European Robin",
     "de": "rotkehlchen"
   },
   "7": {
-    "ru": "sumpfmeise",
-    "en": "sumpfmeise",
+    "ru": "Болотная гаичка",
+    "en": "Marsh Tit",
     "de": "sumpfmeise"
   }
 }

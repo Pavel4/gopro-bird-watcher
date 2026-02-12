@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bird Classifier для GoPro Bird Watcher
-Классификация видов (Vogel EfficientNet-B2 ONNX)
+Классификация видов (Vogel EfficientNet-B2)
 + распознавание поведения (TSM-MobileNetV3).
 
 Пайплайн:
@@ -9,7 +9,11 @@ Bird Classifier для GoPro Bird Watcher
 2. VogelClassifier → вид птицы (8 классов)
 3. BehaviorClassifier → поведение (TSM)
 
-Зависимости: onnxruntime, numpy, opencv
+Поддержка форматов моделей:
+  - TorchScript (.pt) — приоритетный
+  - ONNX (.onnx) — fallback
+
+Зависимости: numpy, opencv, torch или onnxruntime
 """
 
 import os
@@ -26,6 +30,13 @@ import cv2
 import numpy as np
 
 try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
+
+try:
     import onnxruntime as ort
     ONNX_AVAILABLE = True
 except ImportError:
@@ -36,7 +47,9 @@ except ImportError:
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 # Vogel EfficientNet-B2 модель
-VOGEL_MODEL_FILE = "vogel_bird_classifier.onnx"
+# Приоритет: TorchScript (.pt) > ONNX (.onnx)
+VOGEL_PT_FILE = "vogel_bird_classifier.pt"
+VOGEL_ONNX_FILE = "vogel_bird_classifier.onnx"
 VOGEL_PREPROCESS_FILE = "vogel_preprocess.json"
 SPECIES_LABELS_FILE = "species_labels.json"
 
@@ -128,7 +141,11 @@ class VogelClassifier:
         self.logger = (
             logger or logging.getLogger(__name__)
         )
+        # ONNX session (fallback)
         self.session = None
+        # TorchScript model (primary)
+        self.ts_model = None
+        self.backend = None  # "torchscript"|"onnx"
         self.labels = {}
         self.mean = IMAGENET_MEAN
         self.std = IMAGENET_STD
@@ -195,88 +212,143 @@ class VogelClassifier:
             )
 
     def _load_model(self):
-        """Загрузить ONNX модель."""
-        if not ONNX_AVAILABLE:
+        """
+        Загрузить модель. Приоритет:
+        1. TorchScript (.pt) — надёжный
+        2. ONNX (.onnx) — fallback
+        """
+        pt_path = os.path.join(
+            self.model_dir, VOGEL_PT_FILE,
+        )
+        onnx_path = os.path.join(
+            self.model_dir, VOGEL_ONNX_FILE,
+        )
+
+        # --- TorchScript (.pt) ---
+        if (
+            os.path.exists(pt_path)
+            and TORCH_AVAILABLE
+        ):
+            try:
+                self.ts_model = torch.jit.load(
+                    pt_path,
+                    map_location="cpu",
+                )
+                self.ts_model.eval()
+                self.backend = "torchscript"
+                size_mb = (
+                    os.path.getsize(pt_path)
+                    / (1024 ** 2)
+                )
+                self.logger.info(
+                    f"  🐦 Vogel model loaded: "
+                    f"{VOGEL_PT_FILE}"
+                    f" ({size_mb:.1f} MB), "
+                    f"backend=TorchScript"
+                )
+                return
+            except Exception as e:
+                self.logger.warning(
+                    f"  TorchScript load failed"
+                    f": {e}, trying ONNX..."
+                )
+
+        # --- ONNX (.onnx) fallback ---
+        if (
+            os.path.exists(onnx_path)
+            and ONNX_AVAILABLE
+        ):
+            try:
+                self._load_onnx_model(
+                    onnx_path
+                )
+                return
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to load ONNX: {e}"
+                )
+
+        # --- Ничего не найдено ---
+        if os.path.exists(pt_path):
+            self.logger.error(
+                "torch not installed. "
+                "Install: pip install torch"
+            )
+        elif os.path.exists(onnx_path):
             self.logger.error(
                 "onnxruntime not installed. "
-                "Install: pip install onnxruntime"
+                "Install: pip install "
+                "onnxruntime"
             )
-            return
-
-        model_path = os.path.join(
-            self.model_dir, VOGEL_MODEL_FILE,
-        )
-        if not os.path.exists(model_path):
+        else:
             self.logger.warning(
-                f"  Vogel model not found: "
-                f"{model_path}. "
+                f"  Vogel model not found. "
                 f"Run: python scripts/"
                 f"export_vogel_onnx.py"
             )
-            return
 
+    def _load_onnx_model(self, model_path):
+        """Загрузить ONNX модель (fallback)."""
+        providers = (
+            ort.get_available_providers()
+        )
+        preferred = [
+            p for p in (
+                "CoreMLExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            )
+            if p in providers
+        ]
+        # CoreML может глючить — fallback
         try:
-            providers = (
-                ort.get_available_providers()
+            self.session = (
+                ort.InferenceSession(
+                    model_path,
+                    providers=(
+                        preferred or providers
+                    ),
+                )
             )
-            preferred = [
-                p for p in (
-                    "CoreMLExecutionProvider",
-                    "CUDAExecutionProvider",
-                    "CPUExecutionProvider",
+        except Exception:
+            self.logger.warning(
+                "  CoreML failed, "
+                "trying CPU..."
+            )
+            self.session = (
+                ort.InferenceSession(
+                    model_path,
+                    providers=[
+                        "CPUExecutionProvider"
+                    ],
                 )
-                if p in providers
-            ]
-            # CoreML может глючить — fallback
-            try:
-                self.session = (
-                    ort.InferenceSession(
-                        model_path,
-                        providers=(
-                            preferred or providers
-                        ),
-                    )
-                )
-            except Exception:
-                self.logger.warning(
-                    "  CoreML failed, "
-                    "trying CPU..."
-                )
-                self.session = (
-                    ort.InferenceSession(
-                        model_path,
-                        providers=[
-                            "CPUExecutionProvider"
-                        ],
-                    )
-                )
+            )
 
-            size_mb = (
-                os.path.getsize(model_path)
-                / (1024 ** 2)
-            )
-            used_provider = (
-                self.session.get_providers()[0]
-                if self.session
-                else "none"
-            )
-            self.logger.info(
-                f"  🐦 Vogel model loaded: "
-                f"{VOGEL_MODEL_FILE}"
-                f" ({size_mb:.1f} MB), "
-                f"provider={used_provider}"
-            )
-        except Exception as e:
-            self.logger.error(
-                f"Failed to load Vogel model: "
-                f"{e}"
-            )
-            self.session = None
+        self.backend = "onnx"
+        size_mb = (
+            os.path.getsize(model_path)
+            / (1024 ** 2)
+        )
+        used_provider = (
+            self.session.get_providers()[0]
+            if self.session
+            else "none"
+        )
+        self.logger.info(
+            f"  🐦 Vogel model loaded: "
+            f"{VOGEL_ONNX_FILE}"
+            f" ({size_mb:.1f} MB), "
+            f"provider={used_provider}"
+        )
 
     def is_ready(self) -> bool:
         """Проверить готовность."""
+        has_model = (
+            self.ts_model is not None
+            or self.session is not None
+        )
         return (
-            self.session is not None
+            has_model
             and len(self.labels) > 0
         )
 
@@ -321,14 +393,11 @@ class VogelClassifier:
 
         try:
             img_data = self._preprocess(crop)
-            model_inputs = (
-                self.session.get_inputs()
+            logits = self._run_inference(
+                img_data
             )
-            outputs = self.session.run(
-                None,
-                {model_inputs[0].name: img_data},
-            )
-            logits = outputs[0]  # (1, num_classes)
+            if logits is None:
+                return None
 
             # Softmax
             shifted = (
@@ -368,15 +437,24 @@ class VogelClassifier:
                 f"  Vogel top-3: {top3_str}"
             )
 
+            # Логируем низкую уверенность,
+            # но НЕ отбрасываем — решение
+            # принимает голосование в
+            # _classify_from_video.
+            ru_name = label.get('ru', '?')
             if confidence < self.confidence_threshold:
                 self.logger.info(
                     f"  🐦 Vogel: "
-                    f"{label.get('ru', '?')} "
-                    f"{confidence:.0%} < "
-                    f"{self.confidence_threshold:.0%}"
-                    f" (skip)"
+                    f"{ru_name} "
+                    f"{confidence:.0%} "
+                    f"(low conf)"
                 )
-                return None
+            else:
+                self.logger.info(
+                    f"  🐦 Vogel: "
+                    f"{ru_name} "
+                    f"{confidence:.0%}"
+                )
 
             return SpeciesResult(
                 species_ru=label.get(
@@ -393,6 +471,37 @@ class VogelClassifier:
                 f"{e}"
             )
             return None
+
+    def _run_inference(
+        self, img_data: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """
+        Запустить inference на preprocessed
+        данных. Поддерживает TorchScript и ONNX.
+
+        Args:
+            img_data: [1, 3, 224, 224] float32
+        Returns:
+            logits [1, num_classes] или None
+        """
+        if self.backend == "torchscript":
+            tensor = torch.from_numpy(img_data)
+            with torch.no_grad():
+                logits = self.ts_model(tensor)
+            return logits.numpy()
+        elif self.backend == "onnx":
+            model_inputs = (
+                self.session.get_inputs()
+            )
+            outputs = self.session.run(
+                None,
+                {
+                    model_inputs[0].name:
+                        img_data,
+                },
+            )
+            return outputs[0]
+        return None
 
     def classify_with_probs(
         self, crop: np.ndarray,
@@ -411,14 +520,11 @@ class VogelClassifier:
 
         try:
             img_data = self._preprocess(crop)
-            model_inputs = (
-                self.session.get_inputs()
+            logits = self._run_inference(
+                img_data
             )
-            outputs = self.session.run(
-                None,
-                {model_inputs[0].name: img_data},
-            )
-            logits = outputs[0]
+            if logits is None:
+                return None, None
 
             shifted = (
                 logits
@@ -805,11 +911,15 @@ class BirdClassifier:
         self.vogel_classifier = None
         self.behavior_classifier = None
 
-        if not ONNX_AVAILABLE:
+        if (
+            not TORCH_AVAILABLE
+            and not ONNX_AVAILABLE
+        ):
             self.logger.error(
-                "❌ onnxruntime not installed! "
+                "❌ Neither torch nor "
+                "onnxruntime installed! "
                 "ML disabled. Install: "
-                "pip install onnxruntime"
+                "pip install torch"
             )
             return
 

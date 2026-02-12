@@ -100,6 +100,8 @@ class FeederAnalytics:
 
         # Счётчик визитов (загружается из CSV)
         self._next_visit_id = 1
+        # Последний завершённый visit_id
+        self.last_visit_id = 0
 
         # Пути к CSV-файлам
         os.makedirs(self.analytics_dir, exist_ok=True)
@@ -270,6 +272,7 @@ class FeederAnalytics:
 
             visit_id = self._next_visit_id
             self._next_visit_id += 1
+            self.last_visit_id = visit_id
 
             video_file = self._last_video_file or ""
 
